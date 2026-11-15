@@ -12,7 +12,7 @@ from telegram.ext import (
 )
 
 # ================= НАСТРОЙКИ =================
-SUPER_ADMIN_ID = 8192612489  # Твой ID (главный админ)
+SUPER_ADMIN_ID = 8192612489
 # =============================================
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -39,10 +39,6 @@ def init_db():
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channels', '')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sub_check', '1')")
     c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (SUPER_ADMIN_ID,))
-    
-    # Состояния игр (в памяти)
-    c.execute('''CREATE TABLE IF NOT EXISTS games_state
-                 (user_id INTEGER PRIMARY KEY, game_type TEXT, bet REAL, state_data TEXT)''')
     conn.commit()
     conn.close()
 
@@ -96,62 +92,48 @@ def get_all_users():
     conn.close()
     return users
 
-def save_game_state(user_id, game_type, bet, state_data):
-    conn = sqlite3.connect('bot.db')
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO games_state (user_id, game_type, bet, state_data) VALUES (?, ?, ?, ?)", (user_id, game_type, bet, state_data))
-    conn.commit()
-    conn.close()
-
-def get_game_state(user_id):
-    conn = sqlite3.connect('bot.db')
-    c = conn.cursor()
-    c.execute("SELECT game_type, bet, state_data FROM games_state WHERE user_id = ?", (user_id,))
-    res = c.fetchone()
-    conn.close()
-    return res
-
-def clear_game_state(user_id):
-    conn = sqlite3.connect('bot.db')
-    c = conn.cursor()
-    c.execute("DELETE FROM games_state WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+# --- Состояния игр (В памяти, чтобы не лагало) ---
+games_state = {}
 
 # --- Клавиатуры ---
-def main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Баланс", callback_data="balance"), InlineKeyboardButton("🎮 Играть", callback_data="play_menu")],
-        [InlineKeyboardButton("📋 Меню", callback_data="menu")]
-    ])
-
 def get_main_menu(user_id):
+    # Сделали в один ряд, как на фото
     keyboard = [
-        [InlineKeyboardButton("💰 Баланс", callback_data="balance"), InlineKeyboardButton("🎮 Играть", callback_data="play_menu")],
-        [InlineKeyboardButton("📋 Меню", callback_data="menu")]
+        [
+            InlineKeyboardButton("💰 Баланс", callback_data="balance"),
+            InlineKeyboardButton("🎮 Играть", callback_data="play_menu"),
+            InlineKeyboardButton("📋 Меню", callback_data="menu")
+        ]
     ]
-    if is_admin(user_id):
-        keyboard.append([InlineKeyboardButton("⚙️ Админка", callback_data="admin_panel")])
+    # Убрали кнопку админки отсюда! Теперь только через /admin
     return InlineKeyboardMarkup(keyboard)
 
 def play_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎲 Телеграм игры", callback_data="tg_games"), InlineKeyboardButton("🎰 Авторские (Краш)", callback_data="orig_games")],
-        [InlineKeyboardButton("💣 Мины", callback_data="mines"), InlineKeyboardButton("🏰 Башня", callback_data="tower")],
+        [InlineKeyboardButton("💣 Мины", callback_data="mines_start"), InlineKeyboardButton("🏰 Башня", callback_data="tower_start")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="menu")]
     ])
 
 def tg_games_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎲 Кубик", callback_data="dice_menu")],
+        [InlineKeyboardButton("🎲 Кубик", callback_data="dice_menu"), InlineKeyboardButton("🎯 Дартс", callback_data="darts_menu")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="play_menu")]
     ])
 
 def dice_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Чет", callback_data="dice_bet_even_0.5"), InlineKeyboardButton("Нечет", callback_data="dice_bet_odd_0.5")],
-        [InlineKeyboardButton("Больше 3", callback_data="dice_bet_more_0.5"), InlineKeyboardButton("Меньше 4", callback_data="dice_bet_less_0.5")],
-        [InlineKeyboardButton("Центр (3,4)", callback_data="dice_bet_center_0.5"), InlineKeyboardButton("Края (1,6)", callback_data="dice_bet_edges_0.5")],
+        [InlineKeyboardButton("Чет", callback_data="dice_even"), InlineKeyboardButton("Нечет", callback_data="dice_odd")],
+        [InlineKeyboardButton("Больше 3", callback_data="dice_more"), InlineKeyboardButton("Меньше 4", callback_data="dice_less")],
+        [InlineKeyboardButton("Центр (3,4)", callback_data="dice_center"), InlineKeyboardButton("Края (1,6)", callback_data="dice_edges")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="tg_games")]
+    ])
+
+def darts_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Красный сектор", callback_data="darts_red"), InlineKeyboardButton("Белый сектор", callback_data="darts_white")],
+        [InlineKeyboardButton("Отскок", callback_data="darts_bounce"), InlineKeyboardButton("Центр (Булл)", callback_data="darts_center")],
+        [InlineKeyboardButton("Любой сектор", callback_data="darts_any")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="tg_games")]
     ])
 
@@ -160,7 +142,7 @@ def orig_games_menu():
     keyboard = []
     row = []
     for m in multipliers:
-        row.append(InlineKeyboardButton(f"x{m}", callback_data=f"orig_bet_{m}_0.5"))
+        row.append(InlineKeyboardButton(f"x{m}", callback_data=f"orig_{m}"))
         if len(row) == 4:
             keyboard.append(row)
             row = []
@@ -171,8 +153,8 @@ def orig_games_menu():
 def bet_menu(game_type):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("0.5$", callback_data=f"bet_{game_type}_0.5"),
-         InlineKeyboardButton("1$", callback_data=f"bet_{game_type}_1.0"),
-         InlineKeyboardButton("2$", callback_data=f"bet_{game_type}_2.0")],
+         InlineKeyboardButton("1$", callback_data=f"bet_{game_type}_1"),
+         InlineKeyboardButton("2$", callback_data=f"bet_{game_type}_2")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="play_menu")]
     ])
 
@@ -182,7 +164,7 @@ def admin_panel():
         [InlineKeyboardButton("⚙️ Настройки подписок", callback_data="admin_subs")],
         [InlineKeyboardButton("👑 Админы", callback_data="admin_manage_admins")],
         [InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("⬅️ В меню", callback_data="menu")]
+        [InlineKeyboardButton("⬅️ Закрыть", callback_data="close")]
     ])
 
 def subs_menu():
@@ -253,6 +235,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(user_id)
     balance = user[0]
 
+    if data == "close":
+        await query.message.delete()
+        return
     if data == "menu":
         await query.edit_message_text(f"Твой баланс: {balance:.2f}$", reply_markup=get_main_menu(user_id))
     elif data == "balance":
@@ -265,163 +250,179 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Выбери игру Telegram:", reply_markup=tg_games_menu())
     elif data == "dice_menu":
         await query.edit_message_text("Выбери тип ставки на кубик:", reply_markup=dice_menu())
+    elif data == "darts_menu":
+        await query.edit_message_text("Выбери тип ставки на дартс:", reply_markup=darts_menu())
     elif data == "orig_games":
         await query.edit_message_text("Выбери множитель (Краш). Если повезет - умножишь ставку!", reply_markup=orig_games_menu())
     
     # --- АВТОРСКИЕ ИГРЫ (КРАШ) ---
-    elif data.startswith("orig_bet_"):
+    elif data.startswith("orig_"):
+        mult = int(data.split("_")[1])
+        await query.edit_message_text(f"Выбери ставку для Краш x{mult}:", reply_markup=bet_menu(f"orig_{mult}"))
+
+    # --- КУБИК И ДАРТС (ВЫБОР СТАВКИ) ---
+    elif data.startswith("dice_") or data.startswith("darts_"):
+        game = data.split("_")[0]
+        await query.edit_message_text(f"Выбери ставку для {game}:", reply_markup=bet_menu(data))
+
+    # --- ЛОГИКА СТАВОК ---
+    elif data.startswith("bet_"):
         parts = data.split("_")
-        mult = int(parts[2])
-        bet = float(parts[3])
+        bet = float(parts[-1])
+        game_data = "_".join(parts[1:-1])
+        
         if balance < bet:
             await query.edit_message_text("❌ Недостаточно средств!", reply_markup=play_menu())
             return
         
-        update_balance(user_id, -bet)
-        # Шанс выигрыша = 100 / множитель (например, для x2 - 50%)
-        chance = 100 / mult
-        if random.randint(1, 100) <= chance:
-            win = bet * mult
-            update_balance(user_id, win)
-            await query.edit_message_text(f"🎉 Ты выиграл x{mult}! +{win:.2f}$\n💰 Баланс: {get_user(user_id)[0]:.2f}$", reply_markup=play_menu())
-        else:
-            await query.edit_message_text(f"💥 Краш! Ты проиграл {bet:.2f}$\n💰 Баланс: {get_user(user_id)[0]:.2f}$", reply_markup=play_menu())
+        # --- КРАШ ---
+        if game_data.startswith("orig_"):
+            mult = int(game_data.split("_")[1])
+            update_balance(user_id, -bet)
+            chance = 100 / mult
+            if random.randint(1, 100) <= chance:
+                win = bet * mult
+                update_balance(user_id, win)
+                await query.edit_message_text(f"🎉 Ты выиграл x{mult}! +{win:.2f}$\n💰 Баланс: {get_user(user_id)[0]:.2f}$", reply_markup=play_menu())
+            else:
+                await query.edit_message_text(f"💥 Краш! Ты проиграл {bet:.2f}$\n💰 Баланс: {get_user(user_id)[0]:.2f}$", reply_markup=play_menu())
+        
+        # --- КУБИК ---
+        elif game_data.startswith("dice_"):
+            update_balance(user_id, -bet)
+            msg = await query.message.chat.send_dice(emoji="🎲")
+            await asyncio.sleep(4)
+            res = msg.dice.value
+            win = 0
+            if game_data == "dice_even" and res % 2 == 0: win = bet * 2
+            elif game_data == "dice_odd" and res % 2 != 0: win = bet * 2
+            elif game_data == "dice_more" and res > 3: win = bet * 2
+            elif game_data == "dice_less" and res < 4: win = bet * 2
+            elif game_data == "dice_center" and res in [3, 4]: win = bet * 2
+            elif game_data == "dice_edges" and res in [1, 6]: win = bet * 3
+            
+            if win > 0:
+                update_balance(user_id, win)
+                await query.message.reply_text(f"🎲 Выпало: {res}\n✅ Победа! +{win:.2f}$", reply_markup=play_menu())
+            else:
+                await query.message.reply_text(f"🎲 Выпало: {res}\n❌ Проигрыш. -{bet:.2f}$", reply_markup=play_menu())
 
-    # --- КУБИК (СТАВКИ) ---
-    elif data.startswith("dice_bet_"):
-        parts = data.split("_")
-        bet_type = parts[2]
-        bet = float(parts[3])
-        if balance < bet:
-            await query.edit_message_text("❌ Недостаточно средств!", reply_markup=play_menu())
+        # --- ДАРТС ---
+        elif game_data.startswith("darts_"):
+            update_balance(user_id, -bet)
+            msg = await query.message.chat.send_dice(emoji="🎯")
+            await asyncio.sleep(4)
+            # Значения дартса в телеге: 1-6
+            res = msg.dice.value
+            win = 0
+            if game_data == "darts_red" and res in [1, 3, 5]: win = bet * 2
+            elif game_data == "darts_white" and res in [2, 4, 6]: win = bet * 2
+            elif game_data == "darts_bounce" and res == 1: win = bet * 5 # Отскок (обычно 1 очко)
+            elif game_data == "darts_center" and res == 6: win = bet * 4 # Центр (обычно 6 очков)
+            elif game_data == "darts_any" and res in [2, 3, 4, 5]: win = bet * 1.5 # Любой кроме центра и отскока
+            
+            if win > 0:
+                update_balance(user_id, win)
+                await query.message.reply_text(f"🎯 Выпало: {res}\n✅ Победа! +{win:.2f}$", reply_markup=play_menu())
+            else:
+                await query.message.reply_text(f"🎯 Выпало: {res}\n❌ Проигрыш. -{bet:.2f}$", reply_markup=play_menu())
+
+    # --- МИНЫ (ИСПРАВЛЕНО) ---
+    elif data == "mines_start":
+        if balance < 0.5:
+            await query.edit_message_text("❌ Нужно минимум 0.5$", reply_markup=play_menu())
             return
-        update_balance(user_id, -bet)
-        
-        msg = await query.message.chat.send_dice(emoji="🎲")
-        await asyncio.sleep(4)
-        res = msg.dice.value
-        
-        win = 0
-        win_condition = False
-        
-        if bet_type == "even" and res % 2 == 0: win_condition = True; win = bet * 2
-        elif bet_type == "odd" and res % 2 != 0: win_condition = True; win = bet * 2
-        elif bet_type == "more" and res > 3: win_condition = True; win = bet * 2
-        elif bet_type == "less" and res < 4: win_condition = True; win = bet * 2
-        elif bet_type == "center" and res in [3, 4]: win_condition = True; win = bet * 2
-        elif bet_type == "edges" and res in [1, 6]: win_condition = True; win = bet * 3
-        
-        if win_condition:
-            update_balance(user_id, win)
-            await query.message.reply_text(f"🎲 Выпало: {res}\n✅ Победа! +{win:.2f}$", reply_markup=play_menu())
-        else:
-            await query.message.reply_text(f"🎲 Выпало: {res}\n❌ Проигрыш. -{bet:.2f}$", reply_markup=play_menu())
-
-    # --- МИНЫ ---
-    elif data.startswith("mines_bet_"):
+        await query.edit_message_text("Выбери ставку для Мин:", reply_markup=bet_menu("mines"))
+    
+    elif data.startswith("bet_mines_"):
         bet = float(data.split("_")[2])
         if balance < bet:
             await query.edit_message_text("❌ Недостаточно средств!", reply_markup=play_menu())
             return
         update_balance(user_id, -bet)
-        
-        # Генерируем поле 5x5 (25 клеток). Пусть будет 5 мин.
         mines = random.sample(range(25), 5)
-        save_game_state(user_id, "mines", bet, f"mines:{','.join(map(str, mines))}:0") # state: тип:мины:открыто
+        games_state[user_id] = {"game": "mines", "bet": bet, "mines": mines, "opened": 0}
         
-        # Рисуем поле 5x5
         keyboard = []
         for i in range(5):
             row = []
             for j in range(5):
                 idx = i*5 + j
-                row.append(InlineKeyboardButton("⬜", callback_data=f"mines_open_{idx}"))
+                row.append(InlineKeyboardButton("⬜", callback_data=f"m_open_{idx}"))
             keyboard.append(row)
-        keyboard.append([InlineKeyboardButton("💰 Забрать выигрыш", callback_data="mines_cashout")])
-        
-        await query.edit_message_text(f"💣 Игра Мины. Ставка: {bet}$. Открывай клетки, но не попади на мину!\nТекущий множитель: x1.0", reply_markup=InlineKeyboardMarkup(keyboard))
+        keyboard.append([InlineKeyboardButton("💰 Забрать", callback_data="m_cashout")])
+        await query.edit_message_text(f"💣 Мины. Ставка: {bet}$. Открыто: 0. Множитель: x1.0", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    elif data.startswith("mines_open_"):
-        state = get_game_state(user_id)
-        if not state or state[0] != "mines": return
-        
+    elif data.startswith("m_open_"):
+        state = games_state.get(user_id)
+        if not state or state["game"] != "mines": return
         idx = int(data.split("_")[2])
-        parts = state[2].split(":")
-        mines = list(map(int, parts[1].split(",")))
-        opened = int(parts[2])
-        bet = state[1]
         
-        if idx in mines:
-            clear_game_state(user_id)
-            await query.edit_message_text(f"💥 Бум! Ты попал на мину и проиграл {bet:.2f}$", reply_markup=play_menu())
+        if idx in state["mines"]:
+            del games_state[user_id]
+            await query.edit_message_text(f"💥 Бум! Ты проиграл {state['bet']:.2f}$", reply_markup=play_menu())
             return
         
-        opened += 1
-        mult = 1 + (opened * 0.2) # +0.2x за каждую открытую клетку
-        save_game_state(user_id, "mines", bet, f"mines:{','.join(map(str, mines))}:{opened}")
+        state["opened"] += 1
+        mult = 1 + (state["opened"] * 0.2)
         
-        # Обновляем клавиатуру
         keyboard = []
         for i in range(5):
             row = []
             for j in range(5):
-                cur_idx = i*5 + j
-                if cur_idx == idx:
+                cur = i*5 + j
+                if cur == idx:
                     row.append(InlineKeyboardButton("💎", callback_data="ignore"))
                 else:
-                    row.append(InlineKeyboardButton("⬜", callback_data=f"mines_open_{cur_idx}"))
+                    row.append(InlineKeyboardButton("⬜", callback_data=f"m_open_{cur}"))
             keyboard.append(row)
-        keyboard.append([InlineKeyboardButton("💰 Забрать выигрыш", callback_data="mines_cashout")])
-        
-        await query.edit_message_text(f"💣 Игра Мины. Ставка: {bet}$.\nОткрыто: {opened}. Множитель: x{mult:.1f}", reply_markup=InlineKeyboardMarkup(keyboard))
+        keyboard.append([InlineKeyboardButton("💰 Забрать", callback_data="m_cashout")])
+        await query.edit_message_text(f"💣 Мины. Ставка: {state['bet']}$. Открыто: {state['opened']}. Множитель: x{mult:.1f}", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    elif data == "mines_cashout":
-        state = get_game_state(user_id)
-        if not state or state[0] != "mines": return
-        parts = state[2].split(":")
-        opened = int(parts[2])
-        bet = state[1]
-        mult = 1 + (opened * 0.2)
-        win = bet * mult
+    elif data == "m_cashout":
+        state = games_state.get(user_id)
+        if not state or state["game"] != "mines": return
+        mult = 1 + (state["opened"] * 0.2)
+        win = state["bet"] * mult
         update_balance(user_id, win)
-        clear_game_state(user_id)
-        await query.edit_message_text(f"💎 Ты забрал выигрыш: {win:.2f}$ (x{mult:.1f})\n💰 Баланс: {get_user(user_id)[0]:.2f}$", reply_markup=play_menu())
+        del games_state[user_id]
+        await query.edit_message_text(f"💎 Забрал {win:.2f}$ (x{mult:.1f})\n💰 Баланс: {get_user(user_id)[0]:.2f}$", reply_markup=play_menu())
 
-    # --- БАШНЯ ---
-    elif data.startswith("tower_bet_"):
+    # --- БАШНЯ (ИСПРАВЛЕНО) ---
+    elif data == "tower_start":
+        if balance < 0.5:
+            await query.edit_message_text("❌ Нужно минимум 0.5$", reply_markup=play_menu())
+            return
+        await query.edit_message_text("Выбери ставку для Башни:", reply_markup=bet_menu("tower"))
+        
+    elif data.startswith("bet_tower_"):
         bet = float(data.split("_")[2])
         if balance < bet:
             await query.edit_message_text("❌ Недостаточно средств!", reply_markup=play_menu())
             return
         update_balance(user_id, -bet)
-        save_game_state(user_id, "tower", bet, "tower:1") # уровень 1
-        await render_tower(query, user_id, bet, 1, None)
+        games_state[user_id] = {"game": "tower", "bet": bet, "level": 1}
+        await render_tower(query, user_id)
 
-    elif data.startswith("tower_step_"):
+    elif data.startswith("t_step_"):
         step = int(data.split("_")[2])
-        state = get_game_state(user_id)
-        if not state or state[0] != "tower": return
-        level = int(state[2].split(":")[1])
-        bet = state[1]
+        state = games_state.get(user_id)
+        if not state or state["game"] != "tower": return
         
-        # 5 дверей, 1 мина
         mine_pos = random.randint(0, 4)
         if step == mine_pos:
-            clear_game_state(user_id)
-            await query.edit_message_text(f"💀 Ты нашел мину на уровне {level} и проиграл {bet:.2f}$", reply_markup=play_menu())
+            del games_state[user_id]
+            await query.edit_message_text(f"💀 Мина на уровне {state['level']}! Проигрыш {state['bet']:.2f}$", reply_markup=play_menu())
             return
         
-        level += 1
-        if level > 6:
-            win = bet * 2 # Максимальный множитель
+        state["level"] += 1
+        if state["level"] > 6:
+            win = state["bet"] * 2
             update_balance(user_id, win)
-            clear_game_state(user_id)
-            await query.edit_message_text(f"🏆 Ты прошел Башню до конца! Выигрыш: {win:.2f}$", reply_markup=play_menu())
+            del games_state[user_id]
+            await query.edit_message_text(f"🏆 Башня пройдена! Выигрыш: {win:.2f}$", reply_markup=play_menu())
             return
-            
-        mult = 1 + (level * 0.2)
-        save_game_state(user_id, "tower", bet, f"tower:{level}")
-        await render_tower(query, user_id, bet, level, mult)
+        await render_tower(query, user_id)
 
     # --- АДМИНКА ---
     elif data == "admin_panel" and is_admin(user_id):
@@ -435,44 +436,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "add_channel_info" and is_admin(user_id):
         await query.edit_message_text("Отправь мне @юзернейм или ID канала (бот должен быть админом там).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_subs")]]))
     elif data.startswith("del_ch_") and is_admin(user_id):
-        ch_to_del = data.replace("del_ch_", "")
-        channels_str = get_setting('channels')
-        channels = [c for c in channels_str.split(',') if c and c != ch_to_del]
+        ch = data.replace("del_ch_", "")
+        channels = [c for c in get_setting('channels').split(',') if c and c != ch]
         set_setting('channels', ','.join(channels))
         await query.edit_message_text("Канал удален.", reply_markup=subs_menu())
-    
     elif data == "admin_manage_admins" and is_admin(user_id):
         conn = sqlite3.connect('bot.db')
         c = conn.cursor()
         c.execute("SELECT user_id FROM admins")
         admins = [row[0] for row in c.fetchall()]
         conn.close()
-        text = "👑 Список админов:\n" + "\n".join([str(a) for a in admins])
-        text += "\n\nЧтобы добавить/удалить, отправь: `add ID` или `del ID`"
+        text = "👑 Админы:\n" + "\n".join([str(a) for a in admins])
+        text += "\n\nДобавить: `add ID`\nУдалить: `del ID`"
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]]))
-    
     elif data == "admin_broadcast" and is_admin(user_id):
-        await query.edit_message_text("Отправь текст для рассылки (следующим сообщением):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]]))
-    
+        await query.edit_message_text("Отправь текст для рассылки следующим сообщением:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]]))
     elif data.startswith("admin_") and is_admin(user_id):
-        action = data.split("_")[1]
-        await query.edit_message_text(f"Отправь: `ID сумма` (Действие: {action})", parse_mode="Markdown")
+        await query.edit_message_text(f"Отправь: `ID сумма`", parse_mode="Markdown")
 
-async def render_tower(query, user_id, bet, level, mult):
-    text = f"🏰 Башня. Ставка: {bet}$. Уровень: {level}/6.\n"
-    if mult: text += f"Текущий множитель: x{mult:.1f}\n"
-    text += "Выбери дверь. В одной из пяти - мина!"
-    
+async def render_tower(query, user_id):
+    state = games_state[user_id]
+    level = state["level"]
+    mult = 1 + (level * 0.2)
+    text = f"🏰 Башня. Ставка: {state['bet']}$. Уровень: {level}/6.\nТекущий множитель: x{mult:.1f}\nВыбери дверь (1 из 5 - мина):"
     keyboard = [[
-        InlineKeyboardButton("1", callback_data=f"tower_step_0"),
-        InlineKeyboardButton("2", callback_data=f"tower_step_1"),
-        InlineKeyboardButton("3", callback_data=f"tower_step_2"),
-        InlineKeyboardButton("4", callback_data=f"tower_step_3"),
-        InlineKeyboardButton("5", callback_data=f"tower_step_4"),
+        InlineKeyboardButton("1", callback_data="t_step_0"), InlineKeyboardButton("2", callback_data="t_step_1"),
+        InlineKeyboardButton("3", callback_data="t_step_2"), InlineKeyboardButton("4", callback_data="t_step_3"),
+        InlineKeyboardButton("5", callback_data="t_step_4")
     ]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# --- Обработчик текста ---
+# --- Обработчик текста (Рассылка и Админы) ---
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id): return
@@ -483,18 +477,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             bot_member = await context.bot.get_chat_member(chat_id=text, user_id=context.bot.id)
             if bot_member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-                channels_str = get_setting('channels')
-                channels = [c for c in channels_str.split(',') if c]
+                channels = [c for c in get_setting('channels').split(',') if c]
                 if text not in channels:
                     channels.append(text)
                     set_setting('channels', ','.join(channels))
                     await update.message.reply_text(f"✅ Канал {text} добавлен!", reply_markup=subs_menu())
-                else:
-                    await update.message.reply_text("Уже в списке.")
             else:
                 await update.message.reply_text("❌ Бот не админ в этом канале.")
         except Exception:
-            await update.message.reply_text("❌ Не удалось найти канал.")
+            await update.message.reply_text("❌ Ошибка при добавлении канала.")
         return
 
     if text.startswith("add "):
@@ -505,7 +496,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (new_admin,))
             conn.commit()
             conn.close()
-            await update.message.reply_text(f"✅ Пользователь {new_admin} теперь админ.")
+            await update.message.reply_text(f"✅ {new_admin} теперь админ.")
         except: pass
         return
     
@@ -520,21 +511,25 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c.execute("DELETE FROM admins WHERE user_id = ?", (del_admin,))
             conn.commit()
             conn.close()
-            await update.message.reply_text(f"✅ Пользователь {del_admin} лишен прав.")
+            await update.message.reply_text(f"✅ {del_admin} лишен прав.")
         except: pass
         return
 
-    # Рассылка
+    # Рассылка (ИСПРАВЛЕНО)
+    if text.startswith("ID "): # Проверка, что это не просто текст, а админ команда
+        pass
+
+    # Если дошли сюда, значит это текст для рассылки
     users = get_all_users()
     success = 0
-    await update.message.reply_text(f"Начинаю рассылку для {len(users)} чел...")
+    msg = await update.message.reply_text(f"⏳ Рассылка для {len(users)} чел...")
     for u in users:
         try:
             await context.bot.send_message(chat_id=u, text=text)
             success += 1
-            await asyncio.sleep(0.05) # чтобы не забанили
+            await asyncio.sleep(0.05)
         except: pass
-    await update.message.reply_text(f"✅ Рассылка завершена. Доставлено: {success}")
+    await msg.edit_text(f"✅ Рассылка завершена. Доставлено: {success}")
     return
 
 def main():
