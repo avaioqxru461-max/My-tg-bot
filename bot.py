@@ -134,6 +134,25 @@ def subs_menu():
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin")])
     return InlineKeyboardMarkup(keyboard)
 
+def get_main_keyboard(user_id):
+    """Возвращает главное меню с кнопкой админки, если это админ"""
+    if user_id == ADMIN_ID:
+        keyboard = [
+            [InlineKeyboardButton("⚙️ Админка", callback_data="admin")],
+            [InlineKeyboardButton("🎁 Бонус", callback_data="bonus")],
+            [InlineKeyboardButton("🎮 Игры", callback_data="games")],
+            [InlineKeyboardButton("💰 Баланс", callback_data="balance")],
+            [InlineKeyboardButton("👥 Рефералы", callback_data="ref")],
+        ]
+    else:
+        keyboard = [
+            [InlineKeyboardButton("🎁 Бонус", callback_data="bonus")],
+            [InlineKeyboardButton("🎮 Игры", callback_data="games")],
+            [InlineKeyboardButton("💰 Баланс", callback_data="balance")],
+            [InlineKeyboardButton("👥 Рефералы", callback_data="ref")],
+        ]
+    return InlineKeyboardMarkup(keyboard)
+
 # --- Проверка подписки ---
 async def check_subscription(user_id, context):
     if get_setting('sub_check') != '1':
@@ -184,10 +203,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Для использования бота подпишись на наши каналы!", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    admin_btn = [[InlineKeyboardButton("⚙️ Админка", callback_data="admin")]] if user_id == ADMIN_ID else []
     await update.message.reply_text(
         f"Привет! Твой баланс: {user[0]:.2f}$\nВыбери действие:",
-        reply_markup=InlineKeyboardMarkup(admin_btn + main_menu().inline_keyboard)
+        reply_markup=get_main_keyboard(user_id)
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -200,14 +218,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "check_sub":
         if await check_subscription(user_id, context):
-            admin_btn = [[InlineKeyboardButton("⚙️ Админка", callback_data="admin")]] if user_id == ADMIN_ID else []
-            await query.edit_message_text(f"Спасибо за подписку!\nТвой баланс: {balance:.2f}$", reply_markup=InlineKeyboardMarkup(admin_btn + main_menu().inline_keyboard))
+            await query.edit_message_text(f"Спасибо за подписку!\nТвой баланс: {balance:.2f}$", reply_markup=get_main_keyboard(user_id))
         else:
             await query.edit_message_text("Ты подписался не на все каналы!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Проверить еще раз", callback_data="check_sub")]]))
 
     elif data == "menu":
-        admin_btn = [[InlineKeyboardButton("⚙️ Админка", callback_data="admin")]] if user_id == ADMIN_ID else []
-        await query.edit_message_text(f"Твой баланс: {balance:.2f}$\nВыбери действие:", reply_markup=InlineKeyboardMarkup(admin_btn + main_menu().inline_keyboard))
+        await query.edit_message_text(f"Твой баланс: {balance:.2f}$\nВыбери действие:", reply_markup=get_main_keyboard(user_id))
 
     elif data == "balance":
         await query.edit_message_text(f"💰 Твой баланс: {balance:.2f}$", reply_markup=main_menu())
