@@ -41,11 +41,11 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 XROCKET_TOKEN = os.environ.get("XROCKET_TOKEN")
 DB_PATH = os.environ.get("DB_PATH", "casino.db")
 
-START_BALANCE = 200      # 2$ в центах
-FEE = 0.95               # комиссия казино 5%
-RAKEBACK_PCT = 2         # 2% от ставки
-MIN_BET = 10             # 0.10$
-MIN_TX = 10              # 0.1$
+START_BALANCE = 200
+FEE = 0.95
+RAKEBACK_PCT = 2
+MIN_BET = 10
+MIN_TX = 10
 HTML = ParseMode.HTML
 
 RANKS = [
@@ -73,7 +73,7 @@ DICE = {
     }},
     "basket": {"emoji": "🏀", "n": 5, "opts": {
         "goal": ("Гол", {4, 5}), "nogoal": ("Без гола", {1, 2, 3}),
-        "bounce": ("Отскок", {1}), "stuck": ("Застрял", {2, 3}), "clean": ("Чистый гол", {5}),
+        "bounce": ("Отскок", {1}), "stuck": ("Застрял", {2, 3}), "spin": ("Прокрут", {1, 2}),
     }},
     "bowling": {"emoji": "🎳", "n": 6, "opts": {
         "strike": ("Страйк", {6}), "miss": ("Мимо", {1}),
@@ -82,7 +82,7 @@ DICE = {
 }
 
 CRASH_MULTS = [2, 3, 4, 5, 10, 30, 50, 100]
-TOWER_MULTS = [1.0, 1.2, 1.5, 1.9, 2.5, 3.5]
+TOWER_MULTS = [1.0, 1.3, 1.8, 2.5, 3.5, 5.0]
 TOWER_LEVELS = 6
 TOWER_DOORS = 5
 MINES_STATE = {}
@@ -193,6 +193,29 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     await update.message.reply_text(f"🎰 <b>Добро пожаловать!</b>\n\n💰 Баланс: <b>{m(u['balance'])}</b>", reply_markup=MAIN_KB, parse_mode=HTML)
 
+async def cmd_kazna(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not XROCKET_TOKEN:
+        await update.message.reply_text("❌ Нет токена xRocket.")
+        return
+    url = "https://pay.api.xrocket.exchange/api/v1/balances"
+    headers = {"Authorization": f"Bearer {XROCKET_TOKEN}"}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            balances = data.get("balances", [])
+            if not balances:
+                await update.message.reply_text("💰 Казна пуста.")
+                return
+            text = "🏦 <b>Казна xRocket:</b>\n"
+            for b in balances:
+                text += f"• {b.get('asset')}: {b.get('amount')}\n"
+            await update.message.reply_text(text, parse_mode=HTML)
+        else:
+            await update.message.reply_text(f"❌ Ошибка: {r.status_code}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
 async def show_balance(update, ctx):
     u = get_user(update.effective_user.id)
     kb = IM([[IB("💳 Пополнить", callback_data="dep:start"), IB("💸 Вывести", callback_data="wd:start")]])
@@ -241,7 +264,7 @@ async def next_step(update, ctx):
     if not game or not bet:
         return await show_games(update, ctx)
     head = f"<b>{GAME_TITLES[game]}</b>\n💵 Ставка: <b>{m(bet)}</b>\n\n"
-    chg = [IB("💵 Сменить ставку", callback_data=f"g:{game}"), IB("⬅️ В игры", callback_data="menu:play")]
+    chg = [IB("💵 Сменить ставку", callback_data=f"g:{game}"), IB("🎮 Другие игры", callback_data="menu:play")]
     if game in DICE:
         cfg = DICE[game]
         items = list(cfg["opts"].items())
@@ -282,7 +305,7 @@ async def play_dice(update, ctx, game, key):
         settle(uid, game, bet, payout, f"{label}; выпало {dmsg.dice.value}")
         res = f"🎉 <b>ПОБЕДА!</b>\n💵 Выплата: <b>+{m(payout)}</b>" if win else f"😔 <b>Проигрыш</b>\n💸 −{m(bet)}"
         text = f"<b>{GAME_TITLES[game]}</b>\n🎲 Выпало: <b>{dmsg.dice.value}</b>\n\n{res}\n\n💰 Баланс: <b>{m(get_user(uid)['balance'])}</b>"
-        kb = IM([[IB("🔁 Повторить", callback_data=f"p:{game}:{key}")], [IB("⬅️ В игры", callback_data="menu:play")]])
+        kb = IM([[IB("🔁 Повторить", callback_data=f"p:{game}:{key}")], [IB("🎮 Другие игры", callback_data="menu:play")]])
         await ctx.bot.send_message(q.message.chat_id, text, reply_markup=kb, parse_mode=HTML)
     finally:
         BUSY.discard(uid)
@@ -298,7 +321,7 @@ async def play_crash(update, ctx, mult):
     payout = calc(bet, mult) if win else 0
     settle(uid, "crash", bet, payout, f"x{mult}")
     res = f"🚀 <b>Выиграл x{mult}!</b>\n💵 Выплата: <b>+{m(payout)}</b>" if win else f"💥 <b>Краш, проигрыш</b>\n💸 −{m(bet)}"
-    kb = IM([[IB("🔁 Повторить", callback_data=f"cr:{mult}")], [IB("⬅️ В игры", callback_data="menu:play")]])
+    kb = IM([[IB("🔁 Повторить", callback_data=f"cr:{mult}")], [IB("🎮 Другие игры", callback_data="menu:play")]])
     await respond(update, f"<b>🎰 Краш</b>\n🎯 Множитель: <b>x{mult}</b>\n\n{res}\n\n💰 Баланс: <b>{m(get_user(uid)['balance'])}</b>", kb)
     return None
 
@@ -355,7 +378,7 @@ async def mines_click(update, ctx, arg):
         del MINES_STATE[uid]
         payout = calc(st["bet"], mines_mult(st["m"], len(st["opened"])))
         settle(uid, "mines", st["bet"], payout, f"x{mines_mult(st['m'], len(st['opened'])):.2f}")
-        await respond(update, f"🎉 <b>Выигрыш {m(payout)}!</b>", mines_kb(st, reveal=True, extra=[[IB("🔁 Снова", callback_data="g:mines")]]))
+        await respond(update, f"🎉 <b>Выигрыш {m(payout)}!</b>", mines_kb(st, reveal=True, extra=[[IB("🎮 Другие игры", callback_data="menu:play")]]))
         return None
     try: i = int(arg)
     except ValueError: return "Ошибка"
@@ -363,14 +386,14 @@ async def mines_click(update, ctx, arg):
     if i in st["mines"]:
         del MINES_STATE[uid]
         settle(uid, "mines", st["bet"], 0)
-        await respond(update, f"💥 <b>БУМ! Проигрыш {m(st['bet'])}</b>", mines_kb(st, reveal=True, hit=i, extra=[[IB("🔁 Снова", callback_data="g:mines")]]))
+        await respond(update, f"💥 <b>БУМ! Проигрыш {m(st['bet'])}</b>", mines_kb(st, reveal=True, hit=i, extra=[[IB("🎮 Другие игры", callback_data="menu:play")]]))
         return None
     st["opened"].add(i)
     if len(st["opened"]) == 25 - st["m"]:
         del MINES_STATE[uid]
         payout = calc(st["bet"], mines_mult(st["m"], len(st["opened"])))
         settle(uid, "mines", st["bet"], payout)
-        await respond(update, f"🏆 <b>Всё открыто! Выигрыш {m(payout)}</b>", mines_kb(st, reveal=True, extra=[[IB("🔁 Снова", callback_data="g:mines")]]))
+        await respond(update, f"🏆 <b>Всё открыто! Выигрыш {m(payout)}</b>", mines_kb(st, reveal=True, extra=[[IB("🎮 Другие игры", callback_data="menu:play")]]))
         return None
     await respond(update, mines_text(st), mines_kb(st))
     return None
@@ -387,7 +410,7 @@ def tower_text(st):
                 row.append("🚪")
             else:
                 row.append("🔒")
-        lines.append(f"Уровень {lvl + 1}: " + " ".join(row))
+        lines.append(f"Уровень {lvl + 1} (x{TOWER_MULTS[lvl]:.1f}): " + " ".join(row))
     if st["level"] > 0:
         cur = TOWER_MULTS[st["level"] - 1]
         lines.append(f"\nСейчас: x{cur:.1f} → {m(calc(st['bet'], cur))}")
@@ -417,21 +440,21 @@ async def tower_click(update, ctx, arg):
         del TOWER_STATE[uid]
         payout = calc(st["bet"], TOWER_MULTS[st["level"] - 1])
         settle(uid, "tower", st["bet"], payout)
-        await respond(update, f"💰 <b>Вы забрали {m(payout)}</b>", IM([[IB("🔁 Снова", callback_data="g:tower")]]))
+        await respond(update, f"💰 <b>Вы забрали {m(payout)}</b>", IM([[IB("🎮 Другие игры", callback_data="menu:play")]]))
         return None
     try: d = int(arg)
     except ValueError: return "Ошибка"
     if st["traps"][st["level"]] == d:
         del TOWER_STATE[uid]
         settle(uid, "tower", st["bet"], 0)
-        await respond(update, f"💥 <b>Мина на уровне {st['level'] + 1}! Проигрыш {m(st['bet'])}</b>", IM([[IB("🔁 Снова", callback_data="g:tower")]]))
+        await respond(update, f"💥 <b>Мина на уровне {st['level'] + 1}! Проигрыш {m(st['bet'])}</b>", IM([[IB("🎮 Другие игры", callback_data="menu:play")]]))
         return None
     st["level"] += 1
     if st["level"] == TOWER_LEVELS:
         del TOWER_STATE[uid]
         payout = calc(st["bet"], TOWER_MULTS[-1])
         settle(uid, "tower", st["bet"], payout)
-        await respond(update, f"🏆 <b>Башня пройдена! Выигрыш {m(payout)}</b>", IM([[IB("🔁 Снова", callback_data="g:tower")]]))
+        await respond(update, f"🏆 <b>Башня пройдена! Выигрыш {m(payout)}</b>", IM([[IB("🎮 Другие игры", callback_data="menu:play")]]))
         return None
     await respond(update, tower_text(st), tower_kb(st))
     return None
@@ -521,10 +544,46 @@ async def admin_process(update, ctx, action, rid):
     r = db.execute(f"SELECT * FROM {table} WHERE id=?", (rid,)).fetchone()
     if not r or r["status"] != "pending": return "Уже обработано"
     uid, amount = r["user_id"], r["amount"]
-    if action == "wok": note = f"✅ Вывод #{rid} на {m(amount)} одобрен."
-    elif action == "wno": add_balance(uid, amount); note = f"❌ Вывод #{rid} отклонён, {m(amount)} возвращены."
-    elif action == "dok": add_balance(uid, amount); note = f"✅ На ваш баланс зачислено {m(amount)}!"
-    else: note = f"❌ Пополнение #{rid} отклонено."
+    
+    if action == "wok":
+        # Создаем чек через xRocket для вывода
+        if not XROCKET_TOKEN:
+            note = f"✅ Вывод #{rid} одобрен (но нет токена для чека)."
+        else:
+            url = "https://pay.api.xrocket.exchange/api/v1/cheques"
+            headers = {"Authorization": f"Bearer {XROCKET_TOKEN}", "Content-Type": "application/json"}
+            payload = {
+                "asset": "USDT",
+                "amount": str(amount / 100.0),
+                "description": f"Withdraw for {uid}",
+                "targetType": "telegram_user_id",
+                "target": str(uid)
+            }
+            try:
+                resp = requests.post(url, json=payload, headers=headers, timeout=10)
+                if resp.status_code in (200, 201):
+                    data = resp.json()
+                    cheque_link = data.get("links", {}).get("telegramMiniAppLink")
+                    if cheque_link:
+                        note = f"✅ Вывод #{rid} одобрен! Чек создан."
+                        try:
+                            await ctx.bot.send_message(uid, f"💸 Ваш вывод на {m(amount)} одобрен!\nПолучите средства по ссылке:", reply_markup=IM([[IB("🎁 Получить", url=cheque_link)]]))
+                        except Exception: pass
+                    else:
+                        note = f"✅ Вывод #{rid} одобрен, но ссылка на чек не получена."
+                else:
+                    note = f"⚠️ Вывод #{rid} одобрен, но ошибка создания чека: {resp.status_code}"
+            except Exception as e:
+                note = f"⚠️ Вывод #{rid} одобрен, но ошибка: {e}"
+    elif action == "wno":
+        add_balance(uid, amount)
+        note = f"❌ Вывод #{rid} отклонён, {m(amount)} возвращены."
+    elif action == "dok":
+        add_balance(uid, amount)
+        note = f"✅ На ваш баланс зачислено {m(amount)}!"
+    else:
+        note = f"❌ Пополнение #{rid} отклонено."
+        
     db.execute(f"UPDATE {table} SET status=? WHERE id=?", ("approved" if "ok" in action else "rejected", rid))
     db.commit()
     try: await q.edit_message_text(f"{q.message.text}\n\n➡️ Статус: {note}")
@@ -617,6 +676,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else: await show_profile(update, ctx)
         return
 
+    if low == "казна":
+        await cmd_kazna(update, ctx)
+        return
+
     aw = ctx.user_data.get("await")
 
     if aw and aw.startswith("adm_"):
@@ -673,7 +736,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await create_withdraw(update, ctx, amt)
         return
 
-    # Число без слов (например, 0.3 или 0.3$)
     if re.fullmatch(r"[\d.,]+\$?", low):
         amt = parse_amount(low)
         if amt and amt >= MIN_BET:
