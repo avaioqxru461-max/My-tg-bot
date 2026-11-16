@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Telegram-бот с играми (python-telegram-bot 20.7, SQLite, Flask для Render).
-"""
-
 import os
 import re
 import html
@@ -207,15 +203,20 @@ async def cmd_kazna(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not balances:
                 await update.message.reply_text("💰 Казна пуста.")
                 return
-            text = "🏦 <b>Казна xRocket (баланс приложения):</b>\n"
+            text = "🏦 <b>Казна xRocket:</b>\n"
+            has_money = False
             for b in balances:
                 asset = b.get('asset', '?')
-                bal = b.get('balance', '0')
-                avail = b.get('available', '0')
-                text += f"• <b>{asset}</b>: {bal} (доступно: {avail})\n"
-            await update.message.reply_text(text, parse_mode=HTML)
+                bal = float(b.get('balance', 0))
+                if bal > 0:
+                    text += f"• {bal:.2f} {asset.lower()}\n"
+                    has_money = True
+            if not has_money:
+                await update.message.reply_text("💰 На балансе нет средств.")
+            else:
+                await update.message.reply_text(text, parse_mode=HTML)
         else:
-            await update.message.reply_text(f"❌ Ошибка xRocket: {r.status_code}\n{r.text[:200]}")
+            await update.message.reply_text(f"❌ Ошибка xRocket: {r.status_code}")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
@@ -550,34 +551,26 @@ async def admin_process(update, ctx, action, rid):
     uid, amount = r["user_id"], r["amount"]
     
     if action == "wok":
-        if not XROCKET_TOKEN:
-            note = f"✅ Вывод #{rid} одобрен (но нет токена для чека)."
-        else:
+        note = f"✅ Вывод #{rid} одобрен."
+        if XROCKET_TOKEN:
             url = "https://pay.api.xrocket.exchange/api/v1/cheques"
             headers = {"Authorization": f"Bearer {XROCKET_TOKEN}", "Content-Type": "application/json"}
-            payload = {
-                "asset": "USDT",
-                "amount": str(amount / 100.0),
-                "description": f"Withdraw for {uid}",
-                "targetType": "telegram_user_id",
-                "target": str(uid)
-            }
+            payload = {"asset": "USDT", "amount": str(amount / 100.0), "description": f"Withdraw for {uid}", "targetType": "telegram_user_id", "target": str(uid)}
             try:
                 resp = requests.post(url, json=payload, headers=headers, timeout=10)
                 if resp.status_code in (200, 201):
                     data = resp.json()
                     cheque_link = data.get("links", {}).get("telegramMiniAppLink")
                     if cheque_link:
-                        note = f"✅ Вывод #{rid} одобрен! Чек создан."
-                        try:
-                            await ctx.bot.send_message(uid, f"💸 Ваш вывод на {m(amount)} одобрен!\nПолучите средства по ссылке:", reply_markup=IM([[IB("🎁 Получить", url=cheque_link)]]))
+                        note += " Чек создан."
+                        try: await ctx.bot.send_message(uid, f"💸 Вывод на {m(amount)} одобрен!\nПолучите средства:", reply_markup=IM([[IB("🎁 Получить", url=cheque_link)]]))
                         except Exception: pass
                     else:
-                        note = f"✅ Вывод #{rid} одобрен, но ссылка на чек не получена."
+                        note += " (Ссылка на чек не получена)"
                 else:
-                    note = f"⚠️ Вывод #{rid} одобрен, но ошибка создания чека: {resp.status_code}"
+                    note += f" (Ошибка чека: {resp.status_code})"
             except Exception as e:
-                note = f"⚠️ Вывод #{rid} одобрен, но ошибка: {e}"
+                note += f" (Ошибка: {e})"
     elif action == "wno":
         add_balance(uid, amount)
         note = f"❌ Вывод #{rid} отклонён, {m(amount)} возвращены."
@@ -763,7 +756,7 @@ async def on_error(update, ctx):
 
 # ───────────────────────── FLASK + WEBHOOK ─────────────────────────
 flask_app = Flask(__name__)
-bot_app = None  # будет установлен в main()
+bot_app = None
 
 @flask_app.route("/")
 def index(): return "Bot is running"
@@ -773,9 +766,10 @@ def health(): return "ok"
 
 @flask_app.route("/xrocket-webhook", methods=["POST"])
 def xrocket_webhook():
-    """Обработчик вебхуков от xRocket Pay."""
     try:
         data = request.get_json(force=True)
+        log.info(f"Webhook received: {data}")
+        
         if not data:
             return jsonify({"status": "no data"}), 400
         
@@ -788,7 +782,6 @@ def xrocket_webhook():
             status = invoice.get("status")
             
             if status == "paid":
-                # Ищем депозит по invoice_id
                 row = db.execute("SELECT * FROM deposits WHERE invoice_id=? AND status='pending'", (str(invoice_id),)).fetchone()
                 if row:
                     uid = row["user_id"]
@@ -798,7 +791,6 @@ def xrocket_webhook():
                     db.commit()
                     log.info(f"Автозачисление: user {uid} +{m(amount)}")
                     
-                    # Уведомляем игрока
                     if bot_app:
                         try:
                             asyncio.run_coroutine_threadsafe(
