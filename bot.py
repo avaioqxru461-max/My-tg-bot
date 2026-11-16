@@ -452,7 +452,10 @@ async def admin_process(update, ctx, action, rid):
     elif action == "dok": add_balance(uid, amount); note = f"✅ Пополнение #{rid} на {m(amount)} зачислено!"
     else: note = f"❌ Пополнение #{rid} отклонено."
     db.execute(f"UPDATE {table} SET status=? WHERE id=?", ("approved" if "ok" in action else "rejected", rid)); db.commit()
-    try: await q.edit_message_text(f"{q.message.text}\n\n➡️ Статус: {note}"); except: pass
+    try:
+    await q.edit_message_text(f"{q.message.text}\n\n➡️ Статус: {note}")
+except Exception:
+    pass
     try: await ctx.bot.send_message(uid, note); except: pass
     return None
 
