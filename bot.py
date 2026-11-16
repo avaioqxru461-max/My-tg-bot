@@ -14,7 +14,7 @@ import logging
 import threading
 import requests
 
-from flask import Flask
+from flask import Flask, request, jsonify
 from telegram import (
     Update,
     InlineKeyboardButton as IB,
@@ -99,7 +99,7 @@ def init_db():
     db.executescript("""
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, balance INTEGER NOT NULL DEFAULT 0, rakeback INTEGER NOT NULL DEFAULT 0, turnover INTEGER NOT NULL DEFAULT 0, rank_claimed INTEGER NOT NULL DEFAULT 0, custom_bet INTEGER NOT NULL DEFAULT 0, created INTEGER);
         CREATE TABLE IF NOT EXISTS bets(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, game TEXT, bet INTEGER, payout INTEGER, detail TEXT, ts INTEGER);
-        CREATE TABLE IF NOT EXISTS deposits(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, status TEXT, ts INTEGER);
+        CREATE TABLE IF NOT EXISTS deposits(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, status TEXT, invoice_id TEXT, ts INTEGER);
         CREATE TABLE IF NOT EXISTS withdrawals(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, status TEXT, ts INTEGER);
         CREATE TABLE IF NOT EXISTS channels(chat TEXT PRIMARY KEY);
     """)
@@ -207,12 +207,15 @@ async def cmd_kazna(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not balances:
                 await update.message.reply_text("💰 Казна пуста.")
                 return
-            text = "🏦 <b>Казна xRocket:</b>\n"
+            text = "🏦 <b>Казна xRocket (баланс приложения):</b>\n"
             for b in balances:
-                text += f"• {b.get('asset')}: {b.get('amount')}\n"
+                asset = b.get('asset', '?')
+                bal = b.get('balance', '0')
+                avail = b.get('available', '0')
+                text += f"• <b>{asset}</b>: {bal} (доступно: {avail})\n"
             await update.message.reply_text(text, parse_mode=HTML)
         else:
-            await update.message.reply_text(f"❌ Ошибка: {r.status_code}")
+            await update.message.reply_text(f"❌ Ошибка xRocket: {r.status_code}\n{r.text[:200]}")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
@@ -474,8 +477,9 @@ async def create_deposit(update, ctx, amount):
         if r.status_code in (200, 201):
             data = r.json()
             link = data.get("links", {}).get("telegramBotLink")
+            invoice_id = data.get("id")
             if link:
-                cur = db.execute("INSERT INTO deposits(user_id, amount, status, ts) VALUES(?,?,?,?)", (uid, amount, "pending", int(time.time())))
+                db.execute("INSERT INTO deposits(user_id, amount, status, invoice_id, ts) VALUES(?,?,?,?,?)", (uid, amount, "pending", invoice_id, int(time.time())))
                 db.commit()
                 await update.message.reply_text(f"💳 <b>Счет на {m(amount)}</b>\nОплатите:", reply_markup=IM([[IB("💳 Оплатить", url=link)]]), parse_mode=HTML)
                 return
@@ -546,7 +550,6 @@ async def admin_process(update, ctx, action, rid):
     uid, amount = r["user_id"], r["amount"]
     
     if action == "wok":
-        # Создаем чек через xRocket для вывода
         if not XROCKET_TOKEN:
             note = f"✅ Вывод #{rid} одобрен (но нет токена для чека)."
         else:
@@ -758,8 +761,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_error(update, ctx):
     log.error("Ошибка: %s", ctx.error, exc_info=ctx.error)
 
-# ───────────────────────── FLASK ─────────────────────────
+# ───────────────────────── FLASK + WEBHOOK ─────────────────────────
 flask_app = Flask(__name__)
+bot_app = None  # будет установлен в main()
 
 @flask_app.route("/")
 def index(): return "Bot is running"
@@ -767,15 +771,59 @@ def index(): return "Bot is running"
 @flask_app.route("/health")
 def health(): return "ok"
 
+@flask_app.route("/xrocket-webhook", methods=["POST"])
+def xrocket_webhook():
+    """Обработчик вебхуков от xRocket Pay."""
+    try:
+        data = request.get_json(force=True)
+        if not data:
+            return jsonify({"status": "no data"}), 400
+        
+        event_type = data.get("type")
+        event_data = data.get("data", {})
+        
+        if event_type == "invoice":
+            invoice = event_data.get("invoice", {})
+            invoice_id = invoice.get("id")
+            status = invoice.get("status")
+            
+            if status == "paid":
+                # Ищем депозит по invoice_id
+                row = db.execute("SELECT * FROM deposits WHERE invoice_id=? AND status='pending'", (str(invoice_id),)).fetchone()
+                if row:
+                    uid = row["user_id"]
+                    amount = row["amount"]
+                    add_balance(uid, amount)
+                    db.execute("UPDATE deposits SET status='approved' WHERE id=?", (row["id"],))
+                    db.commit()
+                    log.info(f"Автозачисление: user {uid} +{m(amount)}")
+                    
+                    # Уведомляем игрока
+                    if bot_app:
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                bot_app.bot.send_message(uid, f"✅ На ваш баланс зачислено {m(amount)}!"),
+                                bot_app.loop
+                            )
+                        except Exception as e:
+                            log.error(f"Не удалось уведомить: {e}")
+        
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        log.error(f"Webhook error: {e}")
+        return jsonify({"status": "error"}), 500
+
 def run_flask():
     flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), use_reloader=False)
 
 # ───────────────────────── ЗАПУСК ─────────────────────────
 def main():
+    global bot_app
     if not TOKEN: raise SystemExit("Нет TELEGRAM_TOKEN")
     init_db()
     threading.Thread(target=run_flask, daemon=True).start()
     app = Application.builder().token(TOKEN).concurrent_updates(True).build()
+    bot_app = app
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CallbackQueryHandler(on_cb))
