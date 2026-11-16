@@ -45,7 +45,7 @@ START_BALANCE = 200      # 2$ в центах
 FEE = 0.95               # комиссия казино 5%
 RAKEBACK_PCT = 2         # 2% от ставки на рейкбек-счёт
 MIN_BET = 10             # 0.10$
-MIN_TX = 100             # минимум для пополнения/вывода 1$
+MIN_TX = 10              # ИЗМЕНЕНО: минимум для пополнения/вывода 0.1$ (10 центов)
 HTML = ParseMode.HTML
 
 # Ранги: (оборот в центах, название, эмодзи, бонус в центах)
@@ -437,9 +437,13 @@ async def create_deposit(update, ctx, amount):
         await update.message.reply_text("❌ Ошибка: Платежная система временно недоступна.")
         return
     amount_usdt = amount / 100.0 
-    url = "https://pay.xrocket.tg/api/v1/invoices"
+    url = "https://pay.api.xrocket.exchange/api/v1/invoices"
     headers = {"Authorization": f"Bearer {XROCKET_TOKEN}", "Content-Type": "application/json"}
-    payload = {"amount": amount_usdt, "currency": "USDT", "description": f"Deposit for {uid}"}
+    payload = {
+        "priceAmount": str(amount_usdt),
+        "priceCurrency": "USDT",
+        "description": f"Deposit for {uid}"
+    }
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=10)
         data = r.json()
