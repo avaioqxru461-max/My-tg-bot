@@ -66,6 +66,7 @@ GAMES = [
     ("mines", "💣 Мины"), ("tower", "🏰 Башня"),
 ]
 GAME_TITLES = dict(GAMES)
+STAT_TITLES = {**GAME_TITLES, "dice2": "🎲🎲 Два кубика"}
 
 DICE = {
     "dice": {"emoji": "🎲", "n": 6, "opts": {
@@ -73,10 +74,10 @@ DICE = {
         "high": ("Больше (4-6)", {4, 5, 6}), "low": ("Меньше (1-3)", {1, 2, 3}),
         "center": ("Центр (3-4)", {3, 4}), "edge": ("Края (1,2,5,6)", {1, 2, 5, 6}),
     }},
-    # Дартс: Красный ТОЛЬКО 1,3,5; Белый ТОЛЬКО 2,4 (без центра и отскока в этих исходах)
+    # Дартс (Telegram): 1 — мимо/отскок, 2 и 4 — красное, 3 и 5 — белое, 6 — центр. Красный x3, Белый x3
     "darts": {"emoji": "🎯", "n": 6, "opts": {
-        "red": ("Красный", {1, 3, 5}),
-        "white": ("Белый", {2, 4}),
+        "red": ("Красный", {2, 4}),
+        "white": ("Белый", {3, 5}),
         "bounce": ("Отскок", {1}),
         "bull": ("Центр", {6}),
     }},
@@ -96,6 +97,18 @@ DICE = {
         "k1": ("Сбито 1/6", {2}), "k3": ("Сбито 3/6", {3}),
         "k4": ("Сбито 4/6", {4}), "k5": ("Сбито 5/6", {5}),
     }},
+}
+
+_ALL2 = [(a, b) for a in range(1, 7) for b in range(1, 7)]
+DICE2 = {
+    "ee": ("Оба чёт", {p for p in _ALL2 if p[0] % 2 == 0 and p[1] % 2 == 0}),
+    "oo": ("Оба нечёт", {p for p in _ALL2 if p[0] % 2 == 1 and p[1] % 2 == 1}),
+    "hh": ("Оба больше (4-6)", {p for p in _ALL2 if p[0] >= 4 and p[1] >= 4}),
+    "ll": ("Оба меньше (1-3)", {p for p in _ALL2 if p[0] <= 3 and p[1] <= 3}),
+    "p18": ("Произведение > 18", {p for p in _ALL2 if p[0] * p[1] > 18}),
+    "gt": ("1 > 2", {p for p in _ALL2 if p[0] > p[1]}),
+    "lt": ("2 > 1", {p for p in _ALL2 if p[0] < p[1]}),
+    "dbl": ("Любой дубль", {p for p in _ALL2 if p[0] == p[1]}),
 }
 
 CRASH_MULTS = [2, 3, 4, 5, 10, 30, 50, 100]
@@ -263,14 +276,16 @@ def is_admin(uid):
 
 
 def end_rows(repeat_cb=None, game=None):
-    """Кнопки после окончания игры: повтор / сменить ставку / другие игры."""
+    """Кнопки после игры: повтор / другой исход с той же ставкой / ставка / игры."""
     rows = []
     if repeat_cb:
         rows.append([IB("🔁 Повторить", callback_data=repeat_cb)])
+    if game and game != "tower":
+        rows.append([IB("📋 Другой исход", callback_data=f"o:{game}")])
     row = []
     if game:
-        row.append(IB("💵 Сменить ставку", callback_data=f"gs:{game}"))
-    row.append(IB("🎮 Другие игры", callback_data="menu:play"))
+        row.append(IB("💵 Ставка", callback_data=f"gs:{game}"))
+    row.append(IB("🎮 Игры", callback_data="menu:play"))
     rows.append(row)
     return rows
 
@@ -448,13 +463,27 @@ async def cmd_kazna(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def show_balance(update, ctx):
     u = get_user(update.effective_user.id)
-    kb = IM([[IB("💳 Пополнить", callback_data="dep:start"), IB("💸 Вывести", callback_data="wd:start")]])
+    kb = IM([
+        [IB("💳 Пополнить", callback_data="dep:start"), IB("💸 Вывести", callback_data="wd:start")],
+        [IB("🎮 Играть", callback_data="menu:play")],
+    ])
     await respond(update, f"💰 <b>Баланс:</b> {m(u['balance'])}\n♻️ <b>Рейкбек:</b> {m(u['rakeback'])}", kb)
 
 
 async def show_menu(update, ctx):
-    kb = IM([[IB("🎮 Играть", callback_data="menu:play"), IB("👤 Профиль", callback_data="menu:profile")]])
-    await respond(update, "📋 <b>Меню</b>\n\nБыстрая ставка: <code>ставка 1.5</code> или <code>вб</code>", kb)
+    uid = update.effective_user.id
+    u = get_user(uid)
+    bet = get_bet(ctx, uid)
+    kb = IM([
+        [IB("🎮 Играть", callback_data="menu:play"), IB("👤 Профиль", callback_data="menu:profile")],
+        [IB("💳 Пополнить", callback_data="dep:start"), IB("💸 Вывести", callback_data="wd:start")],
+    ])
+    await respond(
+        update,
+        f"📋 <b>Меню</b>\n\n💰 Баланс: <b>{m(u['balance'])}</b>\n💵 Ставка: <b>{m(bet) if bet else 'не выбрана'}</b>\n\n"
+        "Быстрая ставка: <code>ставка 1.5</code>\nНа весь баланс: <code>вб</code>",
+        kb,
+    )
 
 
 async def show_profile(update, ctx):
@@ -477,25 +506,53 @@ async def show_profile(update, ctx):
         rows.append([IB(f"🎁 Бонус за ранг (+{m(bonus)})", callback_data="rank:claim")])
     if u["rakeback"] > 0:
         rows.append([IB(f"♻️ Забрать рейкбек ({m(u['rakeback'])})", callback_data="rb:claim")])
+    rows.append([IB("🎮 Играть", callback_data="menu:play")])
     await respond(update, text, IM(rows))
 
 
 async def show_games(update, ctx):
-    if await need_sub(update, ctx, update.effective_user.id):
+    uid = update.effective_user.id
+    if await need_sub(update, ctx, uid):
         return
-    rows = [[IB(t, callback_data=f"g:{k}") for k, t in GAMES[i:i + 2]] for i in range(0, len(GAMES), 2)]
-    rows.append([IB("⬅️ Назад", callback_data="menu:back")])
-    await respond(update, "🎮 <b>Выберите игру:</b>", IM(rows))
+    u = get_user(uid)
+    bet = get_bet(ctx, uid)
+
+    def gb(k):
+        return IB(GAME_TITLES[k], callback_data=f"g:{k}")
+
+    text = (
+        "🎮 <b>Игровое меню</b>\n"
+        f"💰 Баланс: <b>{m(u['balance'])}</b>\n"
+        f"💵 Ставка: <b>{m(bet) if bet else 'не выбрана'}</b>\n\n"
+        "🎲 <b>Кубики и спорт</b> — быстрые исходы\n"
+        "💎 <b>На риск</b> — растущий множитель\n\n"
+        "Выберите игру 👇"
+    )
+    rows = [
+        [IB("━━ 🎲 КУБИКИ И СПОРТ ━━", callback_data="noop")],
+        [gb("dice"), gb("darts")],
+        [gb("football"), gb("basket")],
+        [gb("bowling")],
+        [IB("━━ 💎 НА РИСК ━━", callback_data="noop")],
+        [gb("crash"), gb("mines"), gb("tower")],
+        [IB(f"💵 Ставка: {m(bet)}" if bet else "💵 Выбрать ставку", callback_data="gs:x")],
+        [IB("👤 Профиль", callback_data="menu:profile"), IB("💳 Баланс", callback_data="bal:show")],
+        [IB("⬅️ Назад", callback_data="menu:back")],
+    ]
+    await respond(update, text, IM(rows))
 
 
 # ───────────────────────── ИГРЫ ─────────────────────────
 async def show_bet_menu(update, ctx, game):
     uid = update.effective_user.id
     u = get_user(uid)
-    ctx.user_data["game"] = game
+    if game == "x":
+        ctx.user_data.pop("game", None)
+    else:
+        ctx.user_data["game"] = game
     cur = get_bet(ctx, uid)
     text = (
-        f"<b>{GAME_TITLES[game]}</b>\n💰 Баланс: <b>{m(u['balance'])}</b>\n"
+        f"<b>{GAME_TITLES.get(game, '💵 Выбор ставки')}</b>\n💰 Баланс: <b>{m(u['balance'])}</b>\n"
         + (f"💵 Ставка: <b>{m(cur)}</b>\n" if cur else "")
         + "\nВыберите ставку:"
     )
@@ -519,11 +576,24 @@ async def next_step(update, ctx):
     chg = [IB("💵 Сменить ставку", callback_data=f"gs:{game}"), IB("🎮 Другие игры", callback_data="menu:play")]
     if game in DICE:
         cfg = DICE[game]
-        items = list(cfg["opts"].items())
-        rows = [
-            [IB(f"{lab} · x{fm(cfg['n'] / len(v))}", callback_data=f"p:{game}:{k}") for k, (lab, v) in items[i:i + 2]]
-            for i in range(0, len(items), 2)
-        ]
+        mode = ctx.user_data.get("dice_mode", 1) if game == "dice" else 1
+        if mode == 2:
+            items = list(DICE2.items())
+            rows = [
+                [IB(f"{lab} · x{fm(36 / len(v))}", callback_data=f"q:{k}") for k, (lab, v) in items[i:i + 2]]
+                for i in range(0, len(items), 2)
+            ]
+        else:
+            items = list(cfg["opts"].items())
+            rows = [
+                [IB(f"{lab} · x{fm(cfg['n'] / len(v))}", callback_data=f"p:{game}:{k}") for k, (lab, v) in items[i:i + 2]]
+                for i in range(0, len(items), 2)
+            ]
+        if game == "dice":
+            rows.insert(0, [
+                IB(("✅ " if mode == 1 else "") + "1 куб", callback_data="dm:1"),
+                IB(("✅ " if mode == 2 else "") + "2 куба", callback_data="dm:2"),
+            ])
         rows.append(chg)
         await respond(update, head + "Выберите исход:", IM(rows))
     elif game == "crash":
@@ -540,49 +610,62 @@ async def next_step(update, ctx):
         await respond(update, head + "6 уровней, 5 дверей на каждом, 1 мина на уровень.", IM(rows))
 
 
-async def play_dice(update, ctx, game, key):
+async def play_dice(update, ctx, game, key, two=False):
     q = update.callback_query
     uid = q.from_user.id
     bet = get_bet(ctx, uid)
     cfg = DICE.get(game)
-    if not cfg or key not in cfg["opts"] or not bet:
+    if not cfg or not bet:
         return "Ошибка ставки"
+    if two:
+        if game != "dice" or key not in DICE2:
+            return "Ошибка ставки"
+        label, vals = DICE2[key]
+        mult = 36 / len(vals)
+        title, log_game, rolls = "🎲🎲 Два кубика", "dice2", 2
+    else:
+        if key not in cfg["opts"]:
+            return "Ошибка ставки"
+        label, vals = cfg["opts"][key]
+        mult = cfg["n"] / len(vals)
+        title, log_game, rolls = GAME_TITLES[game], game, 1
     if uid in BUSY:
         return "Подождите ⏳"
     BUSY.add(uid)
     paid = False
     settled = False
     try:
-        label, vals = cfg["opts"][key]
-        mult = cfg["n"] / len(vals)
         if not place_bet(uid, bet):
             return "❌ Недостаточно средств"
         paid = True
         await q.answer()
         await q.edit_message_text(
-            f"<b>{GAME_TITLES[game]}</b>\n💵 Ставка: <b>{m(bet)}</b>\n🎯 Исход: <b>{label}</b> (x{fm(mult)})\n\n⏳ Бросаем...",
+            f"<b>{title}</b>\n💵 Ставка: <b>{m(bet)}</b>\n🎯 Исход: <b>{label}</b> (x{fm(mult)})\n\n⏳ Бросаем...",
             parse_mode=HTML,
         )
-        dmsg = await ctx.bot.send_dice(chat_id=q.message.chat_id, emoji=cfg["emoji"])
+        msgs = []
+        for _ in range(rolls):
+            msgs.append(await ctx.bot.send_dice(chat_id=q.message.chat_id, emoji=cfg["emoji"]))
         await asyncio.sleep(4)
-        value = dmsg.dice.value
-        win = value in vals
+        values = [x.dice.value for x in msgs]
+        win = (tuple(values) in vals) if two else (values[0] in vals)
         payout = calc(bet, mult) if win else 0
-        settle(uid, game, bet, payout, f"{label}; выпало {value}")
+        shown = " и ".join(str(v) for v in values)
+        settle(uid, log_game, bet, payout, f"{label}; выпало {shown}")
         settled = True
         if win:
             res = f"🎉 <b>ПОБЕДА!</b>\n💵 Выплата: <b>+{m(payout)}</b>"
         else:
             res = f"😔 <b>Проигрыш</b>\n💸 −{m(bet)}"
         text = (
-            f"<b>{GAME_TITLES[game]}</b>\n🎲 Выпало: <b>{value}</b>\n\n{res}\n\n"
+            f"<b>{title}</b>\n🎯 Ваш исход: <b>{label}</b>\n🎲 Выпало: <b>{shown}</b>\n\n{res}\n\n"
             f"💰 Баланс: <b>{m(get_user(uid)['balance'])}</b>"
         )
-        kb = IM(end_rows(f"p:{game}:{key}", game))
-        await ctx.bot.send_message(q.message.chat_id, text, reply_markup=kb, parse_mode=HTML)
+        repeat_cb = f"q:{key}" if two else f"p:{game}:{key}"
+        await ctx.bot.send_message(q.message.chat_id, text, reply_markup=IM(end_rows(repeat_cb, game)), parse_mode=HTML)
     except Exception:
         if paid and not settled:
-            add_balance(uid, bet)  # возврат ставки, если бросок не удался
+            add_balance(uid, bet)
         raise
     finally:
         BUSY.discard(uid)
@@ -719,6 +802,7 @@ def tower_text(st):
         "🏰 <b>Башня</b>",
         f"💵 Ставка: <b>{m(st['bet'])}</b>",
         "📈 Множители (снизу вверх): " + " → ".join(f"x{x:.1f}" for x in TOWER_MULTS),
+        "🟢 твой ход · ✅ безопасно · 💥 мина",
     ]
     if st["level"] > 0:
         cur = TOWER_MULTS[st["level"] - 1]
@@ -730,6 +814,14 @@ def tower_text(st):
     return "\n".join(lines)
 
 
+def tower_picks(st):
+    """Список выбранных дверей по уровням (дополняется None для старых сохранений)."""
+    picks = list(st.get("picks") or [])
+    while len(picks) < st["level"]:
+        picks.append(None)
+    return picks
+
+
 def tower_kb(st, reveal=False, extra=None):
     """Сетка: верхний ряд — уровень 6, нижний — уровень 1."""
     rows = []
@@ -738,8 +830,16 @@ def tower_kb(st, reveal=False, extra=None):
         for d in range(TOWER_DOORS):
             trap = st["traps"][lvl]
             if lvl < st["level"]:
-                # пройденный уровень: мина 💥, остальное безопасно ✅
-                row.append(IB("💥" if trap == d else "✅", callback_data="noop"))
+                # пройденный уровень: 🟢 — куда вы пошли, 💥 — где была мина, ✅ — остальные безопасные
+                picks = st.get("picks") or []
+                chosen = picks[lvl] if lvl < len(picks) else None
+                if trap == d:
+                    sym = "💥"
+                elif chosen == d:
+                    sym = "🟢"
+                else:
+                    sym = "✅"
+                row.append(IB(sym, callback_data="noop"))
             elif reveal:
                 # игра окончена: показываем оставшиеся мины
                 row.append(IB("💣" if trap == d else "▫️", callback_data="noop"))
@@ -795,12 +895,14 @@ async def tower_click(update, ctx, arg):
         # уровень для показа: считаем текущий пройденным, чтобы показать 💥 на нём
         shown = dict(st)
         shown["level"] = st["level"] + 1
+        shown["picks"] = tower_picks(st) + [d]
         await respond(
             update,
             f"💥 <b>Мина на уровне {st['level'] + 1}! Проигрыш {m(st['bet'])}</b>",
             tower_kb(shown, reveal=True, extra=after),
         )
         return None
+    st["picks"] = tower_picks(st) + [d]
     st["level"] += 1
     save_game("tower", uid, st)
     if st["level"] == TOWER_LEVELS:
@@ -914,7 +1016,7 @@ async def cb_admin(update, ctx, parts):
             "SELECT game, COUNT(*) n, SUM(bet) b, SUM(payout) p FROM bets GROUP BY game ORDER BY (SUM(bet)-SUM(payout)) DESC"
         ).fetchall()
         gl = "\n".join(
-            f"• {GAME_TITLES.get(x['game'], x['game'])}: {x['n']} игр, прибыль {m(x['b'] - x['p'])}" for x in per_game
+            f"• {STAT_TITLES.get(x['game'], x['game'])}: {x['n']} игр, прибыль {m(x['b'] - x['p'])}" for x in per_game
         ) or "—"
         await q.message.reply_text(
             f"📊 <b>Статистика</b>\n👥 Игроков: <b>{r['c']}</b>\n💰 Балансы игроков (долг казино): <b>{m(r['b'])}</b>\n"
@@ -1054,7 +1156,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # выбор игры: если ставка уже введена — второй раз не спрашиваем
             ctx.user_data.pop("await", None)
             game = parts[1]
-            if game not in GAME_TITLES:
+            if game not in GAME_TITLES and game != "x":
                 res = "Ошибка"
             elif await need_sub(update, ctx, uid):
                 pass
@@ -1070,7 +1172,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # принудительная смена ставки
             ctx.user_data.pop("await", None)
             game = parts[1]
-            if game not in GAME_TITLES:
+            if game not in GAME_TITLES and game != "x":
                 res = "Ошибка"
             elif await need_sub(update, ctx, uid):
                 pass
@@ -1078,11 +1180,14 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await show_bet_menu(update, ctx, game)
         elif t == "b":
             game, val = parts[1], parts[2]
-            if game not in GAME_TITLES:
+            if game not in GAME_TITLES and game != "x":
                 res = "Ошибка"
             else:
                 u = get_user(uid)
-                ctx.user_data["game"] = game
+                if game == "x":
+                    ctx.user_data.pop("game", None)
+                else:
+                    ctx.user_data["game"] = game
                 if val == "in":
                     ctx.user_data["await"] = "bet"
                     await respond(update, "Введите сумму ставки (например, 1.5):", IM([[IB("⬅️ Назад", callback_data=f"gs:{game}")]]))
@@ -1101,10 +1206,21 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         ctx.user_data.pop("await", None)
                         await next_step(update, ctx)
         elif t == "o":
-            ctx.user_data["game"] = parts[1]
-            await next_step(update, ctx)
+            if parts[1] in GAME_TITLES:
+                ctx.user_data["game"] = parts[1]
+                await next_step(update, ctx)
+            else:
+                res = "Ошибка"
         elif t == "p":
             res = await play_dice(update, ctx, parts[1], parts[2])
+        elif t == "q":
+            res = await play_dice(update, ctx, "dice", parts[1], two=True)
+        elif t == "dm":
+            ctx.user_data["dice_mode"] = 2 if parts[1] == "2" else 1
+            ctx.user_data["game"] = "dice"
+            await next_step(update, ctx)
+        elif t == "bal":
+            await show_balance(update, ctx)
         elif t == "cr":
             res = await play_crash(update, ctx, int(parts[1]))
         elif t == "mc":
