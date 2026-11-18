@@ -66,7 +66,7 @@ GAMES = [
     ("mines", "💣 Мины"), ("tower", "🏰 Башня"),
 ]
 GAME_TITLES = dict(GAMES)
-STAT_TITLES = {**GAME_TITLES, "dice2": "🎲🎲 Два кубика"}
+STAT_TITLES = {**GAME_TITLES, "dice2": "🎲🎲 Два кубика", "darts2": "🎯🎯 Два броска"}
 
 DICE = {
     "dice": {"emoji": "🎲", "n": 6, "opts": {
@@ -111,6 +111,22 @@ DICE2 = {
     "dbl": ("Любой дубль", {p for p in _ALL2 if p[0] == p[1]}),
 }
 
+# Дартс, 2 броска. Кольца от края к центру: 1 — отскок, 2..5 — сектора (красный/белый), 6 — центр.
+# Чем больше значение, тем ближе к центру.
+_RED, _WHITE = {2, 4}, {3, 5}
+DARTS2 = {
+    "rr": ("Оба красный", {p for p in _ALL2 if p[0] in _RED and p[1] in _RED}),
+    "ww": ("Оба белый", {p for p in _ALL2 if p[0] in _WHITE and p[1] in _WHITE}),
+    "cl1": ("1 ближе 2", {p for p in _ALL2 if p[0] > p[1]}),
+    "cl2": ("2 ближе 1", {p for p in _ALL2 if p[1] > p[0]}),
+    "sec": ("В сектора", {p for p in _ALL2 if 2 <= p[0] <= 5 and 2 <= p[1] <= 5}),
+    "adj": ("Рядом", {p for p in _ALL2 if 2 <= p[0] <= 5 and 2 <= p[1] <= 5 and abs(p[0] - p[1]) == 1}),
+    "eq": ("Одинаковые", {p for p in _ALL2 if p[0] == p[1]}),
+    "bull2": ("Оба центр", {(6, 6)}),
+    "miss2": ("Оба отскок", {(1, 1)}),
+}
+MULTI = {"dice": DICE2, "darts": DARTS2}
+
 CRASH_MULTS = [2, 3, 4, 5, 10, 30, 50, 100]
 # P(пройти k уровней) = 0.8^k; с учётом FEE=0.95 ожидание игрока ≈ 91-93% на любом уровне
 TOWER_MULTS = [1.2, 1.5, 1.9, 2.4, 3.0, 3.7]
@@ -120,7 +136,7 @@ MINES_STATE = {}
 TOWER_STATE = {}
 BUSY = set()
 
-MAIN_KB = ReplyKeyboardMarkup([["💰 Баланс", "🎮 Играть", "📋 Меню", "👤 Профиль"]], resize_keyboard=True)
+MAIN_KB = ReplyKeyboardMarkup([["💰 Баланс", "🎮 Играть", "📋 Меню"]], resize_keyboard=True)
 
 # ───────────────────────── БАЗА ДАННЫХ ─────────────────────────
 db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
@@ -514,18 +530,17 @@ async def show_games(update, ctx):
     uid = update.effective_user.id
     if await need_sub(update, ctx, uid):
         return
-    u = get_user(uid)
-    bet = get_bet(ctx, uid)
 
     def gb(k):
         return IB(GAME_TITLES[k], callback_data=f"g:{k}")
 
     text = (
-        "🎮 <b>Игровое меню</b>\n"
-        f"💰 Баланс: <b>{m(u['balance'])}</b>\n"
-        f"💵 Ставка: <b>{m(bet) if bet else 'не выбрана'}</b>\n\n"
+        "🎮 <b>Игровое меню</b>\n\n"
         "🎲 <b>Кубики и спорт</b> — быстрые исходы\n"
         "💎 <b>На риск</b> — растущий множитель\n\n"
+        "💡 Ставка: <code>ставка 1.5</code>. Ставить можно текстом: "
+        "<code>куб чет</code>, <code>дартс белый</code>, <code>башня</code>.\n"
+        "Если ставка не задана, её выберете перед игрой.\n\n"
         "Выберите игру 👇"
     )
     rows = [
@@ -535,9 +550,6 @@ async def show_games(update, ctx):
         [gb("bowling")],
         [IB("━━ 💎 НА РИСК ━━", callback_data="noop")],
         [gb("crash"), gb("mines"), gb("tower")],
-        [IB(f"💵 Ставка: {m(bet)}" if bet else "💵 Выбрать ставку", callback_data="gs:x")],
-        [IB("👤 Профиль", callback_data="menu:profile"), IB("💳 Баланс", callback_data="bal:show")],
-        [IB("⬅️ Назад", callback_data="menu:back")],
     ]
     await respond(update, text, IM(rows))
 
@@ -576,11 +588,12 @@ async def next_step(update, ctx):
     chg = [IB("💵 Сменить ставку", callback_data=f"gs:{game}"), IB("🎮 Другие игры", callback_data="menu:play")]
     if game in DICE:
         cfg = DICE[game]
-        mode = ctx.user_data.get("dice_mode", 1) if game == "dice" else 1
-        if mode == 2:
-            items = list(DICE2.items())
+        multi = MULTI.get(game)
+        mode = ctx.user_data.get(f"mode_{game}", 1) if multi else 1
+        if multi and mode == 2:
+            items = list(multi.items())
             rows = [
-                [IB(f"{lab} · x{fm(36 / len(v))}", callback_data=f"q:{k}") for k, (lab, v) in items[i:i + 2]]
+                [IB(f"{lab} · x{fm(36 / len(v))}", callback_data=f"q:{game}:{k}") for k, (lab, v) in items[i:i + 2]]
                 for i in range(0, len(items), 2)
             ]
         else:
@@ -589,10 +602,11 @@ async def next_step(update, ctx):
                 [IB(f"{lab} · x{fm(cfg['n'] / len(v))}", callback_data=f"p:{game}:{k}") for k, (lab, v) in items[i:i + 2]]
                 for i in range(0, len(items), 2)
             ]
-        if game == "dice":
+        if multi:
+            one, two = ("1 куб", "2 куба") if game == "dice" else ("1 бросок", "2 броска")
             rows.insert(0, [
-                IB(("✅ " if mode == 1 else "") + "1 куб", callback_data="dm:1"),
-                IB(("✅ " if mode == 2 else "") + "2 куба", callback_data="dm:2"),
+                IB(("✅ " if mode == 1 else "") + one, callback_data=f"dm:{game}:1"),
+                IB(("✅ " if mode == 2 else "") + two, callback_data=f"dm:{game}:2"),
             ])
         rows.append(chg)
         await respond(update, head + "Выберите исход:", IM(rows))
@@ -612,17 +626,20 @@ async def next_step(update, ctx):
 
 async def play_dice(update, ctx, game, key, two=False):
     q = update.callback_query
-    uid = q.from_user.id
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
     bet = get_bet(ctx, uid)
     cfg = DICE.get(game)
     if not cfg or not bet:
         return "Ошибка ставки"
     if two:
-        if game != "dice" or key not in DICE2:
+        multi = MULTI.get(game)
+        if not multi or key not in multi:
             return "Ошибка ставки"
-        label, vals = DICE2[key]
+        label, vals = multi[key]
         mult = 36 / len(vals)
-        title, log_game, rolls = "🎲🎲 Два кубика", "dice2", 2
+        title = "🎲🎲 Два кубика" if game == "dice" else "🎯🎯 Два броска"
+        log_game, rolls = f"{game}2", 2
     else:
         if key not in cfg["opts"]:
             return "Ошибка ставки"
@@ -638,14 +655,17 @@ async def play_dice(update, ctx, game, key, two=False):
         if not place_bet(uid, bet):
             return "❌ Недостаточно средств"
         paid = True
-        await q.answer()
-        await q.edit_message_text(
-            f"<b>{title}</b>\n💵 Ставка: <b>{m(bet)}</b>\n🎯 Исход: <b>{label}</b> (x{fm(mult)})\n\n⏳ Бросаем...",
-            parse_mode=HTML,
+        status = (
+            f"<b>{title}</b>\n💵 Ставка: <b>{m(bet)}</b>\n🎯 Исход: <b>{label}</b> (x{fm(mult)})\n\n⏳ Бросаем..."
         )
+        if q:
+            await q.answer()
+            await q.edit_message_text(status, parse_mode=HTML)
+        else:
+            await update.effective_message.reply_text(status, parse_mode=HTML)
         msgs = []
         for _ in range(rolls):
-            msgs.append(await ctx.bot.send_dice(chat_id=q.message.chat_id, emoji=cfg["emoji"]))
+            msgs.append(await ctx.bot.send_dice(chat_id=chat_id, emoji=cfg["emoji"]))
         await asyncio.sleep(4)
         values = [x.dice.value for x in msgs]
         win = (tuple(values) in vals) if two else (values[0] in vals)
@@ -661,8 +681,8 @@ async def play_dice(update, ctx, game, key, two=False):
             f"<b>{title}</b>\n🎯 Ваш исход: <b>{label}</b>\n🎲 Выпало: <b>{shown}</b>\n\n{res}\n\n"
             f"💰 Баланс: <b>{m(get_user(uid)['balance'])}</b>"
         )
-        repeat_cb = f"q:{key}" if two else f"p:{game}:{key}"
-        await ctx.bot.send_message(q.message.chat_id, text, reply_markup=IM(end_rows(repeat_cb, game)), parse_mode=HTML)
+        repeat_cb = f"q:{game}:{key}" if two else f"p:{game}:{key}"
+        await ctx.bot.send_message(chat_id, text, reply_markup=IM(end_rows(repeat_cb, game)), parse_mode=HTML)
     except Exception:
         if paid and not settled:
             add_balance(uid, bet)
@@ -673,7 +693,7 @@ async def play_dice(update, ctx, game, key, two=False):
 
 
 async def play_crash(update, ctx, mult):
-    uid = update.callback_query.from_user.id
+    uid = update.effective_user.id
     bet = get_bet(ctx, uid)
     if mult not in CRASH_MULTS or not bet:
         return "Ошибка"
@@ -741,7 +761,7 @@ def mines_text(st):
 
 
 async def mines_start(update, ctx, n):
-    uid = update.callback_query.from_user.id
+    uid = update.effective_user.id
     bet = get_bet(ctx, uid)
     if uid in MINES_STATE:
         st = MINES_STATE[uid]
@@ -759,7 +779,7 @@ async def mines_start(update, ctx, n):
 
 
 async def mines_click(update, ctx, arg):
-    uid = update.callback_query.from_user.id
+    uid = update.effective_user.id
     st = MINES_STATE.get(uid)
     if not st:
         return "Игра не найдена"
@@ -802,7 +822,7 @@ def tower_text(st):
         "🏰 <b>Башня</b>",
         f"💵 Ставка: <b>{m(st['bet'])}</b>",
         "📈 Множители (снизу вверх): " + " → ".join(f"x{x:.1f}" for x in TOWER_MULTS),
-        "🟢 твой ход · ✅ безопасно · 💥 мина",
+        "🟢 твой ход · ✅ безопасно · 💣 мина · 💥 взрыв",
     ]
     if st["level"] > 0:
         cur = TOWER_MULTS[st["level"] - 1]
@@ -830,11 +850,13 @@ def tower_kb(st, reveal=False, extra=None):
         for d in range(TOWER_DOORS):
             trap = st["traps"][lvl]
             if lvl < st["level"]:
-                # пройденный уровень: 🟢 — куда вы пошли, 💥 — где была мина, ✅ — остальные безопасные
+                # пройденный уровень: 🟢 — куда вы пошли, 💣 — обойдённая мина, 💥 — взрыв, ✅ — остальные безопасные
                 picks = st.get("picks") or []
                 chosen = picks[lvl] if lvl < len(picks) else None
-                if trap == d:
-                    sym = "💥"
+                if trap == d and chosen == d:
+                    sym = "💥"  # вы наступили — взрыв
+                elif trap == d:
+                    sym = "💣"  # мина, которую вы обошли
                 elif chosen == d:
                     sym = "🟢"
                 else:
@@ -857,7 +879,7 @@ def tower_kb(st, reveal=False, extra=None):
 
 
 async def tower_click(update, ctx, arg):
-    uid = update.callback_query.from_user.id
+    uid = update.effective_user.id
     after = end_rows("tw:start", "tower")
     if arg == "start":
         if uid in TOWER_STATE:
@@ -1214,11 +1236,14 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif t == "p":
             res = await play_dice(update, ctx, parts[1], parts[2])
         elif t == "q":
-            res = await play_dice(update, ctx, "dice", parts[1], two=True)
+            res = await play_dice(update, ctx, parts[1], parts[2], two=True)
         elif t == "dm":
-            ctx.user_data["dice_mode"] = 2 if parts[1] == "2" else 1
-            ctx.user_data["game"] = "dice"
-            await next_step(update, ctx)
+            if parts[1] in MULTI:
+                ctx.user_data[f"mode_{parts[1]}"] = 2 if parts[2] == "2" else 1
+                ctx.user_data["game"] = parts[1]
+                await next_step(update, ctx)
+            else:
+                res = "Ошибка"
         elif t == "bal":
             await show_balance(update, ctx)
         elif t == "cr":
@@ -1264,6 +1289,148 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer(res, show_alert=bool(res))
     except BadRequest:
         pass
+
+
+def _norm(t):
+    t = t.lower().replace("ё", "е")
+    t = re.sub(r"\s*>\s*", ">", t)
+    t = re.sub(r"[^\w/>.+\s-]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _syn(d):
+    out = {}
+    for k, phrases in d.items():
+        for ph in phrases:
+            out[ph] = k
+    return out
+
+
+TEXT_GAMES = {
+    "куб": "dice", "кубик": "dice", "кубики": "dice", "кубы": "dice", "куба": "dice",
+    "дартс": "darts", "дарт": "darts", "футбол": "football",
+    "баскетбол": "basket", "баскет": "basket", "боулинг": "bowling",
+    "краш": "crash", "мины": "mines", "мина": "mines", "башня": "tower",
+}
+
+TEXT_ONE = {
+    "dice": _syn({
+        "even": ["чет", "четное", "четный", "четные"],
+        "odd": ["нечет", "нечетное", "нечетный", "нечетные"],
+        "high": ["больше", "4-6", "больше 4-6"],
+        "low": ["меньше", "1-3", "меньше 1-3"],
+        "center": ["центр", "3-4"],
+        "edge": ["края", "край"],
+    }),
+    "darts": _syn({
+        "red": ["красный", "красное", "красные", "красн"],
+        "white": ["белый", "белое", "белые"],
+        "bounce": ["отскок", "мимо"],
+        "bull": ["центр", "яблочко"],
+    }),
+    "football": _syn({"goal": ["гол"], "miss": ["мимо"], "center": ["гол в центр", "центр"]}),
+    "basket": _syn({
+        "goal": ["гол"], "nogoal": ["без гола", "нет гола"], "bounce": ["отскок"],
+        "stuck": ["застрял"], "spin": ["прокрут", "прокрутка"],
+    }),
+    "bowling": _syn({
+        "strike": ["страйк"], "miss": ["мимо"],
+        "k1": ["1/6", "сбито 1/6"], "k3": ["3/6", "сбито 3/6"],
+        "k4": ["4/6", "сбито 4/6"], "k5": ["5/6", "сбито 5/6"],
+    }),
+}
+
+TEXT_TWO = {
+    "dice": _syn({
+        "ee": ["оба чет", "оба четные", "оба четных"],
+        "oo": ["оба нечет", "оба нечетные", "оба нечетных"],
+        "hh": ["оба больше", "оба большие"],
+        "ll": ["оба меньше", "оба меньшие"],
+        "p18": ["произведение", "произведение 18", "произведение больше 18", "18", "18+", "больше 18", "произв"],
+        "gt": ["1>2", "1 больше 2", "первый больше"],
+        "lt": ["2>1", "2 больше 1", "второй больше"],
+        "dbl": ["дубль", "дубли", "любой дубль"],
+    }),
+    "darts": _syn({
+        "rr": ["оба красный", "оба красное", "оба красные"],
+        "ww": ["оба белый", "оба белое", "оба белые"],
+        "cl1": ["1 ближе 2", "1 ближе", "первый ближе"],
+        "cl2": ["2 ближе 1", "2 ближе", "второй ближе"],
+        "sec": ["в сектора", "сектора", "в сектор", "сектор"],
+        "adj": ["рядом", "соседние", "соседние сектора"],
+        "eq": ["одинаковые", "одинаково", "одинаковый", "такой же"],
+        "bull2": ["оба центр", "оба центра", "оба яблочко"],
+        "miss2": ["оба отскок", "оба отскока", "оба мимо"],
+    }),
+}
+
+
+async def try_text_bet(update, ctx, text):
+    """Ставки текстом: «куб оба нечет», «дартс белый», «боулинг 1/6», «башня», «мины 3», «краш 5»."""
+    t = _norm(text)
+    first, _, rest = t.partition(" ")
+    game = TEXT_GAMES.get(first)
+    if not game:
+        return False
+    rest = rest.strip()
+    uid = update.effective_user.id
+    msg = update.effective_message
+    if await need_sub(update, ctx, uid):
+        return True
+    u = get_user(uid)
+    ctx.user_data["game"] = game
+    ctx.user_data.pop("await", None)
+
+    action = None
+    if game == "crash":
+        mm = re.fullmatch(r"[xх]?\s*(\d+)", rest)
+        if mm and int(mm.group(1)) in CRASH_MULTS:
+            action = ("crash", int(mm.group(1)))
+    elif game == "mines":
+        mm = re.fullmatch(r"(\d+)(?:\s*(?:мин|мины|мина))?", rest)
+        if mm and 2 <= int(mm.group(1)) <= 12:
+            action = ("mines", int(mm.group(1)))
+    elif game == "tower":
+        if rest in ("", "старт", "начать"):
+            action = ("tower",)
+    else:
+        if game in TEXT_TWO and rest in TEXT_TWO[game]:
+            action = ("roll", game, TEXT_TWO[game][rest], True)
+        elif rest in TEXT_ONE.get(game, {}):
+            action = ("roll", game, TEXT_ONE[game][rest], False)
+
+    bet = get_bet(ctx, uid)
+    if action is None:
+        if rest:
+            await msg.reply_text("🤔 Не понял исход. Выберите кнопкой:")
+        if bet and not check_bet(bet, u["balance"]):
+            await next_step(update, ctx)
+        else:
+            await show_bet_menu(update, ctx, game)
+        return True
+    if not bet:
+        await msg.reply_text("💵 Сначала задайте ставку: напишите «ставка 1.5» или выберите ниже 👇")
+        await show_bet_menu(update, ctx, game)
+        return True
+    err = check_bet(bet, u["balance"])
+    if err:
+        await msg.reply_text(err)
+        return True
+    try:
+        if action[0] == "roll":
+            res = await play_dice(update, ctx, action[1], action[2], two=action[3])
+        elif action[0] == "crash":
+            res = await play_crash(update, ctx, action[1])
+        elif action[0] == "mines":
+            res = await mines_start(update, ctx, action[1])
+        else:
+            res = await tower_click(update, ctx, "start")
+    except Exception:
+        log.exception("text bet error: %s", text)
+        res = "Ошибка"
+    if res:
+        await msg.reply_text(res)
+    return True
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1347,6 +1514,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await create_deposit(update, ctx, amt)
         else:
             await create_withdraw(update, ctx, amt)
+        return
+
+    if await try_text_bet(update, ctx, text):
         return
 
     mt = re.fullmatch(r"(ставка|деп|пополнить|вывод)\s+([\d.,]+)\$?", low)
