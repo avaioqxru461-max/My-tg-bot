@@ -11,6 +11,7 @@ import sqlite3
 import asyncio
 import logging
 import threading
+import traceback
 import requests
 
 from flask import Flask, request, jsonify
@@ -21,7 +22,7 @@ from telegram import (
     ReplyKeyboardMarkup,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -38,6 +39,8 @@ log = logging.getLogger("bot")
 ADMIN_ID = 8192612489
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 XROCKET_TOKEN = os.environ.get("XROCKET_TOKEN")
+# Webhook Token из настроек приложения xRocket Pay (это НЕ API-токен, а отдельный секрет для подписи)
+XROCKET_WEBHOOK_SECRET = os.environ.get("XROCKET_WEBHOOK_SECRET")
 DB_PATH = os.environ.get("DB_PATH", "casino.db")
 # 1 = отклонять вебхуки с неверной подписью (включайте, когда убедитесь, что подпись сходится)
 WEBHOOK_STRICT = os.environ.get("WEBHOOK_STRICT", "0") == "1"
@@ -449,6 +452,23 @@ def xr_create_invoice(uid, amount_cents):
     return False, None, None, _api_error(r, data)
 
 
+def xr_invoice_status(invoice_id):
+    """Статус счёта по данным xRocket: (status | None, http_code). code=0 — сетевая ошибка."""
+    try:
+        r = requests.get(
+            f"{XR_BASE}/invoice", params={"invoiceId": str(invoice_id)}, headers=xr_headers(), timeout=15,
+        )
+    except Exception as e:
+        log.warning("xRocket: не удалось получить счёт %s: %s", invoice_id, e)
+        return None, 0
+    if r.status_code != 200:
+        return None, r.status_code
+    data = _json(r)
+    d = data.get("data") if isinstance(data.get("data"), dict) else data
+    status = str(d.get("status") or "").lower()
+    return (status or None), 200
+
+
 def xr_create_cheque(uid, amount_cents):
     """Возвращает (ok, link, info)."""
     if not XROCKET_TOKEN:
@@ -754,7 +774,7 @@ async def play_dice(update, ctx, game, key, two=False):
             return "❌ Недостаточно средств"
         paid = True
         status = (
-            f"<b>{title}</b>\n💵 Ставка: <b>{m(bet)}</b>\n🎯 Исход: <b>{label}</b> (x{fm(mult)})\n\n⏳ Бросаем..."
+            f"<b>{title}</b>\n💵 Ставка: <b>{m(bet)}</b>\n🎯 Исход: <b>{html.escape(label, quote=False)}</b> (x{fm(mult)})\n\n⏳ Бросаем..."
         )
         if q:
             await q.answer()
@@ -779,7 +799,7 @@ async def play_dice(update, ctx, game, key, two=False):
         else:
             res = f"😔 <b>Проигрыш</b>\n💸 −{m(bet)}"
         text = (
-            f"<b>{title}</b>\n🎯 Ваш исход: <b>{label}</b>\n🎲 Выпало: <b>{shown}</b>\n\n{res}\n\n"
+            f"<b>{title}</b>\n🎯 Ваш исход: <b>{html.escape(label, quote=False)}</b>\n🎲 Выпало: <b>{shown}</b>\n\n{res}\n\n"
             f"💰 Баланс: <b>{m(get_user(uid)['balance'])}</b>"
         )
         repeat_cb = f"q:{game}:{key}" if two else f"p:{game}:{key}"
@@ -1107,7 +1127,6 @@ ADMIN_KB = IM([
     [IB("📢 Подписки и чаты", callback_data="adm:subs"), IB("✉️ Рассылка", callback_data="adm:bc")],
     [IB("🚫 Бан/разбан", callback_data="adm:ban"), IB("💰 Баланс игрока", callback_data="adm:bal")],
     [IB("💬 Заработок в чате", callback_data="adm:earn"), IB("📜 Журнал", callback_data="adm:log")],
-    [IB("💾 Бэкап БД", callback_data="adm:backup")],
 ])
 
 
@@ -1270,7 +1289,11 @@ async def admin_process(update, ctx, action, rid):
     user_kb = None
 
     if action == "wok":
-        ok, link, info = await asyncio.to_thread(xr_create_cheque, uid, amount)
+        try:
+            ok, link, info = await asyncio.to_thread(xr_create_cheque, uid, amount)
+        except Exception as e:
+            log.exception("Ошибка при создании чека")
+            ok, link, info = False, None, f"внутренняя ошибка: {e}"
         if not ok:
             # чек не создан — заявка остаётся в ожидании, баланс игрока не трогаем
             db.execute(f"UPDATE {table} SET status='pending' WHERE id=?", (rid,))
@@ -1440,6 +1463,16 @@ async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ───────────────────────── ПРОВЕРКА ОПЛАТЫ БЕЗ ВЕБХУКА ─────────────────────────
+def close_deposit(invoice_id, status):
+    """Закрывает неоплаченный счёт (истёк/отменён), чтобы не опрашивать его вечно."""
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    try:
+        conn.execute("UPDATE deposits SET status=? WHERE invoice_id=? AND status='pending'", (status, str(invoice_id)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def poll_deposits_sync():
     """Опрашивает неоплаченные счета в xRocket. Возвращает [(user_id, amount)] зачисленных."""
     if not XROCKET_TOKEN or time.time() < POLL["until"]:
@@ -1450,32 +1483,37 @@ def poll_deposits_sync():
     try:
         conn.execute("UPDATE deposits SET status='expired' WHERE status='pending' AND ts<?", (now - 7 * 86400,))
         conn.commit()
+        # сначала самые свежие: старые брошенные счета не должны заслонять новые платежи
         rows = conn.execute(
-            "SELECT * FROM deposits WHERE status='pending' AND invoice_id IS NOT NULL AND ts<? ORDER BY id LIMIT 20",
+            "SELECT * FROM deposits WHERE status='pending' AND invoice_id IS NOT NULL AND ts<? ORDER BY id DESC LIMIT 20",
             (now - 30,),
         ).fetchall()
     finally:
         conn.close()
     done = []
     for r in rows:
-        try:
-            resp = requests.get(f"{XR_BASE}/invoices/{r['invoice_id']}", headers=xr_headers(), timeout=15)
-        except Exception as e:
-            log.warning("poll invoice %s: %s", r["invoice_id"], e)
-            continue
-        if resp.status_code in (404, 405):
-            log.warning("Опрос счетов: метод недоступен (%s), пауза на час; зачисление идёт через вебхук", resp.status_code)
+        status, code = xr_invoice_status(r["invoice_id"])
+        if code == 401:
+            log.error("Опрос счетов: 401, неверный XROCKET_TOKEN. Пауза 10 минут")
+            POLL["until"] = now + 600
+            break
+        if code == 429:
+            log.warning("Опрос счетов: 429, пауза 2 минуты")
+            POLL["until"] = now + 120
+            break
+        if code == 405:
+            log.warning("Опрос счетов: метод недоступен (405), пауза на час; зачисление идёт через вебхук")
             POLL["until"] = now + 3600
             break
-        if resp.status_code != 200:
-            continue
-        data = _json(resp)
-        d = data.get("data") if isinstance(data.get("data"), dict) else data
-        if str(d.get("status") or "").lower() == "paid":
-            uid, amount, code = credit_deposit(r["invoice_id"])
-            if code == "ok":
+        if status is None:
+            continue  # сеть / 404 / 5xx — попробуем в следующий раз
+        if status == "paid":
+            uid, amount, res = credit_deposit(r["invoice_id"])
+            if res == "ok":
                 log.info("Автозачисление (опрос): user %s +%s", uid, m(amount))
                 done.append((uid, amount))
+        elif status in ("expired", "cancelled"):
+            close_deposit(r["invoice_id"], status)
     return done
 
 
@@ -1940,21 +1978,53 @@ async def admin_text_extra(update, ctx, aw, text):
 
 
 # ───────────────────────── ФОНОВЫЕ ЗАДАЧИ ─────────────────────────
+AUTO_BACKUP = os.environ.get("AUTO_BACKUP", "0") == "1"   # автобэкап раз в сутки (по умолчанию выключен)
+AUTO_POLL = os.environ.get("AUTO_POLL", "1") == "1"       # опрос неоплаченных счетов
+ERR_LAST = {}
+
+
+async def report_error(bot, where, exc=None):
+    """Присылает админу текст ошибки (не чаще раза в 5 минут для одного места)."""
+    now = time.time()
+    if now - ERR_LAST.get(where, 0) < 300:
+        return
+    ERR_LAST[where] = now
+    if exc is not None:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    else:
+        tb = traceback.format_exc()
+    try:
+        await bot.send_message(ADMIN_ID, f"⚠️ Ошибка ({html.escape(str(where))}):\n<pre>{html.escape(tb[-900:])}</pre>", parse_mode=HTML)
+    except Exception:
+        pass
+
+
+async def _job_poll(app):
+    done = await asyncio.to_thread(poll_deposits_sync)
+    for uid, amount in done:
+        try:
+            await app.bot.send_message(uid, f"✅ На ваш баланс зачислено {m(amount)}!")
+        except Exception:
+            pass
+
+
 async def background(app):
     await asyncio.sleep(20)
+    jobs = [
+        ("poll", _job_poll if AUTO_POLL else None),
+        ("contests", lambda a: finish_contests(a.bot)),
+        ("top", lambda a: maybe_pay_top(a.bot)),
+        ("backup", (lambda a: maybe_backup(a.bot)) if AUTO_BACKUP else None),
+    ]
     while True:
-        try:
-            done = await asyncio.to_thread(poll_deposits_sync)
-            for uid, amount in done:
-                try:
-                    await app.bot.send_message(uid, f"✅ На ваш баланс зачислено {m(amount)}!")
-                except Exception:
-                    pass
-            await finish_contests(app.bot)
-            await maybe_pay_top(app.bot)
-            await maybe_backup(app.bot)
-        except Exception:
-            log.exception("background error")
+        for name, job in jobs:
+            if job is None:
+                continue
+            try:
+                await job(app)
+            except Exception as e:
+                log.exception("background %s", name)
+                await report_error(app.bot, f"bg:{name}", e)
         await asyncio.sleep(60)
 
 
@@ -2137,6 +2207,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             res = await cb_admin(update, ctx, parts)
     except Exception:
         log.exception("callback error: %s", q.data)
+        await report_error(ctx.bot, f"cb:{q.data}")
         res = "Ошибка"
     try:
         await q.answer(res, show_alert=bool(res))
@@ -2455,7 +2526,17 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_error(update, ctx):
-    log.error("Ошибка: %s", ctx.error, exc_info=ctx.error)
+    err = ctx.error
+    if isinstance(err, Conflict):
+        # запущено два экземпляра бота с одним токеном (например, при редеплое) — это не ошибка кода
+        log.warning("Conflict: этот токен уже используется другим экземпляром бота. Оставьте запущенным только один.")
+        return
+    if isinstance(err, (NetworkError, TimedOut)):
+        # временные сбои сети Telegram: PTB сам повторит запрос, админа не спамим
+        log.warning("Сетевая ошибка Telegram: %s", err)
+        return
+    log.error("Ошибка: %s", err, exc_info=err)
+    await report_error(ctx.bot, f"handler:{type(err).__name__}", err)
 
 
 # ───────────────────────── FLASK + ВЕБХУК XROCKET ─────────────────────────
@@ -2472,13 +2553,27 @@ def health():
     return "ok"
 
 
-def verify_signature(raw, header_sig):
-    """Подпись xRocket: HMAC-SHA256(тело, ключ = SHA256(токен))."""
-    if not XROCKET_TOKEN or not header_sig:
-        return None
-    key = hashlib.sha256(XROCKET_TOKEN.encode()).digest()
-    expected = hmac.new(key, raw, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, header_sig.strip().lower())
+def verify_signature(raw, headers):
+    """Проверка подписи вебхука xRocket Pay.
+    Актуальная схема: заголовки Signature / Signature-Timestamp / Signature-Version (v1),
+    подпись = HMAC-SHA256(webhook_secret, "<timestamp>.<тело>"). Секрет — Webhook Token приложения,
+    а не API-токен. Для приложений на Legacy API оставлена старая схему (rocket-pay-signature).
+    Возвращает True / False, либо None, если проверить нечем."""
+    sig = headers.get("Signature")
+    if sig and XROCKET_WEBHOOK_SECRET:
+        ts = headers.get("Signature-Timestamp", "")
+        if headers.get("Signature-Version") != "v1" or not ts.isdigit():
+            return False
+        if abs(time.time() * 1000 - int(ts)) > 300_000:  # защита от повторной отправки: окно 5 минут
+            return False
+        expected = hmac.new(XROCKET_WEBHOOK_SECRET.encode(), ts.encode() + b"." + raw, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, sig.strip().lower())
+    legacy = headers.get("rocket-pay-signature")
+    if legacy and XROCKET_TOKEN:
+        key = hashlib.sha256(XROCKET_TOKEN.encode()).digest()
+        expected = hmac.new(key, raw, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, legacy.strip().lower())
+    return None
 
 
 def extract_invoice(data):
@@ -2528,7 +2623,7 @@ def tg_send(chat_id, text):
 def xrocket_webhook():
     try:
         raw = request.get_data()
-        sig_ok = verify_signature(raw, request.headers.get("rocket-pay-signature"))
+        sig_ok = verify_signature(raw, request.headers)
         if sig_ok is False:
             log.warning("Webhook: неверная подпись")
             if WEBHOOK_STRICT:
@@ -2537,3 +2632,64 @@ def xrocket_webhook():
             log.warning("Webhook: подписи нет или токен не задан")
             if WEBHOOK_STRICT:
                 return jsonify({"status": "no signature"}), 403
+
+        try:
+            data = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            data = None
+        if not isinstance(data, dict):
+            return jsonify({"status": "bad json"}), 400
+        log.info("Webhook received: %s", data)
+
+        evt, invoice_id, status = extract_invoice(data)
+        paid = status.lower() == "paid" or evt.lower() in ("invoicepay", "invoice_pay", "invoicepaid")
+
+        if invoice_id is not None and paid:
+            # Не верим вебхуку на слово: статус «оплачен» подтверждаем запросом к API xRocket.
+            # Так поддельный вебхук не может начислить деньги, даже если подпись не настроена.
+            api_status, api_code = xr_invoice_status(invoice_id)
+            confirmed = api_status == "paid" or (api_code == 0 and sig_ok is True)
+            if not confirmed:
+                log.warning("Webhook: счёт %s не подтверждён API (status=%s, code=%s), зачисление пропущено",
+                            invoice_id, api_status, api_code)
+                # при сбое сети/лимите просим xRocket повторить доставку, иначе — просто игнорируем
+                return jsonify({"status": "unconfirmed"}), (503 if api_code in (0, 429) or api_code >= 500 else 200)
+            uid, amount, code = credit_deposit(invoice_id)
+            if code == "ok":
+                log.info("Автозачисление: user %s +%s (invoice %s)", uid, m(amount), invoice_id)
+                tg_send(uid, f"✅ На ваш баланс зачислено {m(amount)}!")
+            elif code == "not_found":
+                log.error("Webhook: счёт %s не найден в deposits", invoice_id)
+            else:
+                log.info("Webhook: счёт %s уже обработан", invoice_id)
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        log.exception("Webhook error: %s", e)
+        return jsonify({"status": "error"}), 500
+
+
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), use_reloader=False, threaded=True)
+
+
+# ───────────────────────── ЗАПУСК ─────────────────────────
+def main():
+    if not TOKEN:
+        raise SystemExit("Нет TELEGRAM_TOKEN")
+    init_db()
+    load_games()
+    threading.Thread(target=run_flask, daemon=True).start()
+    app = Application.builder().token(TOKEN).concurrent_updates(True).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("kazna", cmd_kazna))
+    app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
+    log.info("Бот запущен")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
