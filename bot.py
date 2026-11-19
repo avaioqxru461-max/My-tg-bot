@@ -49,15 +49,11 @@ DB_PATH = os.environ.get("DB_PATH", _DEFAULT_DB)   # на постоянном �
 WEBHOOK_STRICT = os.environ.get("WEBHOOK_STRICT", "0") == "1"
 XR_BASE = "https://pay.api.xrocket.exchange/api/v1"
 
-# Crypto Bot (Crypto Pay API): токен берётся в @CryptoBot → Crypto Pay → Create App
+# Crypto Bot (Crypto Pay API): токен берётся в @CryptoBot -> Crypto Pay -> Create App -> API Token
 CRYPTOBOT_TOKEN = os.environ.get("CRYPTOBOT_TOKEN")
-CRYPTOBOT_TESTNET = os.environ.get("CRYPTOBOT_TESTNET", "0") == "1"   # 1 = тестовая сеть (@CryptoTestnetBot)
-CB_BASE = "https://testnet-pay.crypt.bot/api" if CRYPTOBOT_TESTNET else "https://pay.crypt.bot/api"
-CB_ASSET = os.environ.get("CRYPTOBOT_ASSET", "USDT").upper()          # только доллар-стейблкоин: USDT или USDC
-CB_PAYOUT = os.environ.get("CRYPTOBOT_PAYOUT", "check").lower()       # check — чек со ссылкой, transfer — мгновенный перевод
-# Переводы «нк» игрокам без пополнений: лимит в сутки (центы) для отправителя, у которого ещё не было пополнений.
-# 0 = без лимита. Защита от «фарма» стартового бонуса через второй аккаунт.
-TRANSFER_NODEP_DAILY = int(os.environ.get("TRANSFER_NODEP_DAILY", "0"))
+CB_BASE = ("https://testnet-pay.crypt.bot/api" if os.environ.get("CRYPTOBOT_TESTNET", "0") == "1"
+           else "https://pay.crypt.bot/api")
+CB_ASSET = os.environ.get("CRYPTOBOT_ASSET", "USDT").upper()   # в какой монете принимаем и выплачиваем
 
 START_BALANCE = 200
 FEE = 0.95
@@ -67,7 +63,10 @@ MIN_TX = 10
 MAX_BET = int(os.environ.get("MAX_BET", "10000"))                  # макс. ставка, центы ($100)
 MAX_PAYOUT = int(os.environ.get("MAX_PAYOUT", "100000"))           # макс. выплата за одну игру ($1000)
 WD_MIN_DEPOSITED = int(os.environ.get("WD_MIN_DEPOSITED", "100"))  # вывод только после пополнений на ≥ $1
-WD_TURNOVER_X = float(os.environ.get("WD_TURNOVER_X", "1"))        # оборот должен быть ≥ внесённого × X
+WD_TURNOVER_X = float(os.environ.get("WD_TURNOVER_X", "1"))        # (старое имя) множитель вагера
+WAGER_X = float(os.environ.get("WAGER_X", str(WD_TURNOVER_X)))     # вагер после пополнения: отыграть внесённое × X
+TRANSFER_WAGER_X = float(os.environ.get("TRANSFER_WAGER_X", "1"))  # вагер получателю перевода «нк»: сумма × X (0 = выключить)
+TRANSFER_MIN_TURNOVER = int(os.environ.get("TRANSFER_MIN_TURNOVER", "0"))  # мин. оборот отправителя для переводов, центы (0 = без условий)
 HTML = ParseMode.HTML
 
 RANKS = [
@@ -125,16 +124,15 @@ def slot_reels(v):
     return (n & 3, (n >> 2) & 3, (n >> 4) & 3)
 
 
+# Выбираете символ и сколько раз он должен выпасть НА ВСЕХ 3 БАРАБАНАХ: «1 бар» = ровно один BAR (x2.37),
+# «2 бара» = ровно два (x7.11), «3 бара» = три (x64). Выпало другое количество — проигрыш.
 _slot_opts = {}
-SLOT_CNT_MULT = {1: 2.37, 2: 7.11}   # фиксированные иксы (комиссия не применяется): ровно 1 символ / ровно 2 символа
-SLOT_FIXED = {}
-for _c in (1, 2):
+for _n in (1, 2, 3):
     for _i, _k in enumerate(SLOT_KEYS):
-        _slot_opts[f"c{_c}{_k}"] = (
-            f"Ровно {_c}× {SLOT_NAMES[_i]}",
-            {v for v in range(1, 65) if slot_reels(v).count(_i) == _c},
+        _slot_opts[f"c{_n}{_k}"] = (
+            f"Ровно {_n} {SLOT_NAMES[_i]}",
+            {v for v in range(1, 65) if sum(1 for x in slot_reels(v) if x == _i) == _n},
         )
-        SLOT_FIXED[f"c{_c}{_k}"] = SLOT_CNT_MULT[_c]
 _slot_opts["uniq"] = ("Уникальные символы", {v for v in range(1, 65) if len(set(slot_reels(v))) == 3})
 _slot_opts["tri"] = ("Три одинаковых", {v for v in range(1, 65) if len(set(slot_reels(v))) == 1})
 _slot_opts["jp"] = ("Джекпот 777", {64})
@@ -217,23 +215,20 @@ def init_db():
         "ALTER TABLE channels ADD COLUMN kind TEXT NOT NULL DEFAULT 'channel'",
         "ALTER TABLE channels ADD COLUMN official INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE channels ADD COLUMN req INTEGER NOT NULL DEFAULT 1",
-        "ALTER TABLE deposits ADD COLUMN provider TEXT NOT NULL DEFAULT 'xr'",
-        "ALTER TABLE withdrawals ADD COLUMN provider TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE deposits ADD COLUMN provider TEXT NOT NULL DEFAULT 'xrocket'",
+        "ALTER TABLE withdrawals ADD COLUMN provider TEXT NOT NULL DEFAULT 'xrocket'",
     ):
         try:
             db.execute(ddl)
         except sqlite3.OperationalError:
             pass
-    # вагер: сколько ещё нужно отыграть после пополнений (wager) и сколько всего было задано (wager_total)
+    # вагер: сколько ещё нужно поставить (центы). Колонка создаётся один раз, существующим игрокам пересчитывается
     try:
         db.execute("ALTER TABLE users ADD COLUMN wager INTEGER NOT NULL DEFAULT 0")
-        db.execute("ALTER TABLE users ADD COLUMN wager_total INTEGER NOT NULL DEFAULT 0")
-        # перенос со старой схемы «оборот ≥ пополнения»: остаток = пополнено × X − оборот
         db.execute(
             "UPDATE users SET wager = MAX(0, CAST((SELECT COALESCE(SUM(amount),0) FROM deposits d "
-            "WHERE d.user_id=users.id AND d.status='approved') * ? AS INTEGER) - turnover)", (WD_TURNOVER_X,),
+            "WHERE d.user_id=users.id AND d.status='approved') * ? AS INTEGER) - turnover)", (WAGER_X,),
         )
-        db.execute("UPDATE users SET wager_total = wager")
     except sqlite3.OperationalError:
         pass
     db.commit()
@@ -274,6 +269,15 @@ def settle(uid, game, bet, payout, detail=""):
         (uid, game, bet, payout, detail, int(time.time())),
     )
     db.execute("DELETE FROM pending_bets WHERE user_id=? AND game=?", (uid, game))
+    db.commit()
+
+
+def refund_bet(uid, bet):
+    """Возврат ставки при сбое: откатываем и оборот, и рейкбек, и вагер (иначе игрок получал бы их даром)."""
+    db.execute(
+        "UPDATE users SET balance=balance+?, turnover=MAX(0, turnover-?), rakeback=MAX(0, rakeback-?), wager=wager+? WHERE id=?",
+        (bet, bet, bet * RAKEBACK_PCT // 100, bet, uid),
+    )
     db.commit()
 
 
@@ -364,8 +368,8 @@ def fm(x):
     return f"{round(x, 2):g}"
 
 
-def calc(bet, mult, fee=True):
-    return min(int(bet * mult * (FEE if fee else 1.0)), MAX_PAYOUT)
+def calc(bet, mult):
+    return min(int(bet * mult * FEE), MAX_PAYOUT)
 
 
 def parse_amount(s):
@@ -417,50 +421,19 @@ def end_rows(repeat_cb=None, game=None, bet=None):
     return rows
 
 
-def is_group(update):
-    chat = update.effective_chat
-    return chat is not None and chat.type != "private"
+MSG_OWNER = {}   # (chat_id, message_id) -> user_id: в группах кнопки меню работают только у того, кто его открыл
 
 
-def tag_kb(kb, owner_id):
-    """В группах кнопки привязываются к игроку: callback_data получает суффикс #<id>, чужие нажатия отклоняются."""
-    rows = []
-    for row in kb.inline_keyboard:
-        rows.append([
-            IB(b.text, callback_data=f"{b.callback_data}#{owner_id}") if b.callback_data is not None else b
-            for b in row
-        ])
-    return IM(rows)
-
-
-def who(update):
-    """Строка с именем игрока для сообщений в группах (в личке пусто)."""
-    if not is_group(update):
-        return ""
-    u = update.effective_user
-    return f"👤 {html.escape(u.full_name or str(u.id))}\n"
-
-
-def dm_link(ctx):
-    return f"https://t.me/{getattr(ctx.bot, 'username', None) or ''}"
-
-
-def pay_row(update, ctx):
-    if is_group(update):
-        return [IB("💳 Пополнить / 💸 Вывести (в боте)", url=dm_link(ctx))]
-    return [IB("💳 Пополнить", callback_data="dep:start"), IB("💸 Вывести", callback_data="wd:start")]
-
-
-async def send_new(update, ctx, text, kb=None):
-    """Новое сообщение в тот же чат (с привязкой кнопок к игроку в группах)."""
-    if kb is not None and is_group(update):
-        kb = tag_kb(kb, update.effective_user.id)
-    return await ctx.bot.send_message(update.effective_chat.id, text, reply_markup=kb, parse_mode=HTML)
+def track_msg(sent, uid):
+    if sent is None or getattr(sent.chat, "type", "private") == "private":
+        return
+    MSG_OWNER[(sent.chat_id, sent.message_id)] = uid
+    if len(MSG_OWNER) > 5000:
+        for k in list(MSG_OWNER)[:1000]:
+            MSG_OWNER.pop(k, None)
 
 
 async def respond(update, text, kb=None):
-    if kb is not None and is_group(update):
-        kb = tag_kb(kb, update.effective_user.id)
     q = update.callback_query
     if q:
         try:
@@ -469,7 +442,9 @@ async def respond(update, text, kb=None):
             if "not modified" not in str(e).lower():
                 raise
     else:
-        await update.effective_message.reply_text(text, reply_markup=kb, parse_mode=HTML)
+        sent = await update.effective_message.reply_text(text, reply_markup=kb, parse_mode=HTML)
+        if kb is not None and update.effective_user:
+            track_msg(sent, update.effective_user.id)
 
 
 async def need_sub(update, ctx, uid):
@@ -614,181 +589,128 @@ def xr_balances():
 
 
 # ───────────────────────── CRYPTO BOT (Crypto Pay API) ─────────────────────────
-def cb_call(method, params=None, post=False):
-    """Вызов Crypto Pay API. Возвращает (ok, result, error_text, http_code); code=0 — сетевая ошибка."""
+def cb_call(method, params=None):
+    """Вызов Crypto Pay API. Возвращает (result, error, http_code). error=None при успехе, http_code=0 — сетевая ошибка."""
     if not CRYPTOBOT_TOKEN:
-        return False, None, "не задан CRYPTOBOT_TOKEN", 0
-    headers = {"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN}
+        return None, "не задан CRYPTOBOT_TOKEN", 0
     try:
-        if post:
-            r = requests.post(f"{CB_BASE}/{method}", json=params or {}, headers=headers, timeout=15)
-        else:
-            r = requests.get(f"{CB_BASE}/{method}", params=params or {}, headers=headers, timeout=15)
+        r = requests.post(
+            f"{CB_BASE}/{method}", json=params or {},
+            headers={"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN}, timeout=15,
+        )
     except Exception as e:
-        return False, None, f"сеть: {e}", 0
+        return None, f"сеть: {e}", 0
     data = _json(r)
     if r.status_code == 200 and data.get("ok"):
-        return True, data.get("result"), None, 200
+        return data.get("result"), None, 200
     err = data.get("error")
-    if isinstance(err, dict):
-        err = err.get("name") or err.get("message") or str(err)
-    if r.status_code == 401:
-        err = "401: неверный CRYPTOBOT_TOKEN"
-    elif r.status_code == 403 or err in ("METHOD_DISABLED", "METHOD_NOT_FOUND"):
-        err = f"{err or 403}: метод отключён в настройках приложения Crypto Pay (Security)"
-    log.error("CryptoBot %s error %s: %s", method, r.status_code, r.text[:300])
-    return False, None, f"{r.status_code}: {str(err or r.text[:200])[:200]}", r.status_code
-
-
-def _cb_items(result):
-    """getInvoices/getChecks отдают либо список, либо {items: [...]}."""
-    if isinstance(result, dict):
-        return result.get("items") or []
-    return result or []
+    name = (err.get("name") or err.get("code")) if isinstance(err, dict) else err
+    log.error("CryptoBot %s error %s: %s", method, r.status_code, r.text[:500])
+    return None, f"{r.status_code}: {name or r.text[:200]}", (r.status_code or 0)
 
 
 def cb_create_invoice(uid, amount_cents):
     """Возвращает (ok, link, invoice_id, error)."""
-    ok, res, err, _ = cb_call("createInvoice", {
+    res, err, _ = cb_call("createInvoice", {
         "asset": CB_ASSET,
         "amount": f"{amount_cents / 100:.2f}",
         "description": f"Deposit for {uid}",
         "payload": f"dep:{uid}",
         "expires_in": 86400,
-        "allow_anonymous": False,
-    }, post=True)
-    if not ok:
+    })
+    if err:
         return False, None, None, err
-    res = res if isinstance(res, dict) else {}
-    link = res.get("bot_invoice_url") or res.get("pay_url")
+    link = res.get("bot_invoice_url") or res.get("mini_app_invoice_url") or res.get("pay_url")
     invoice_id = res.get("invoice_id")
-    if not link or invoice_id is None:
-        log.error("CryptoBot invoice without link/id: %s", res)
-        return False, None, None, "ответ Crypto Bot без ссылки или id счёта"
-    return True, link, str(invoice_id), None
-
-
-def cb_invoice_statuses(ids):
-    """{invoice_id: status} по списку счетов, либо (None, код) при ошибке."""
-    ok, res, err, code = cb_call("getInvoices", {"invoice_ids": ",".join(str(i) for i in ids), "count": 1000})
-    if not ok:
-        return None, code
-    return {str(i.get("invoice_id")): str(i.get("status") or "").lower() for i in _cb_items(res)}, 200
+    if link and invoice_id is not None:
+        return True, link, str(invoice_id), None
+    log.error("CryptoBot invoice without link/id: %s", res)
+    return False, None, None, "ответ Crypto Bot без ссылки или id счёта"
 
 
 def cb_invoice_status(invoice_id):
-    """(status | None, http_code) — как xr_invoice_status."""
-    st, code = cb_invoice_statuses([invoice_id])
-    if st is None:
+    """(status | None, http_code). status: active / paid / expired."""
+    res, err, code = cb_call("getInvoices", {"invoice_ids": str(invoice_id)})
+    if err:
         return None, code
-    return st.get(str(invoice_id)), 200
+    items = res.get("items") if isinstance(res, dict) else res
+    if not items:
+        return None, 404
+    return str(items[0].get("status") or "").lower() or None, 200
 
 
 def cb_create_check(uid, amount_cents):
-    """Чек Crypto Bot, привязанный к игроку. Возвращает (ok, link, info)."""
-    ok, res, err, _ = cb_call("createCheck", {
-        "asset": CB_ASSET, "amount": f"{amount_cents / 100:.2f}", "pin_to_user_id": int(uid),
-    }, post=True)
-    if not ok:
+    """Чек на выплату, который сможет активировать только этот игрок. Возвращает (ok, link, info)."""
+    res, err, _ = cb_call("createCheck", {
+        "asset": CB_ASSET,
+        "amount": f"{amount_cents / 100:.2f}",
+        "pin_to_user_id": int(uid),
+    })
+    if err:
         return False, None, err
-    link = (res or {}).get("bot_check_url")
-    if not link:
-        return False, None, "ответ Crypto Bot без ссылки на чек"
-    return True, link, "Чек создан"
-
-
-def cb_transfer(uid, amount_cents, spend_id):
-    """Мгновенный перевод (нужно включить Transfers в Security приложения). spend_id защищает от дубля."""
-    ok, res, err, _ = cb_call("transfer", {
-        "user_id": int(uid), "asset": CB_ASSET, "amount": f"{amount_cents / 100:.2f}",
-        "spend_id": str(spend_id)[:64], "comment": "Withdraw",
-    }, post=True)
-    if not ok:
-        return False, None, err
-    return True, None, "Переведено"
-
-
-def cb_payout(uid, amount_cents, rid):
-    if CB_PAYOUT == "transfer":
-        return cb_transfer(uid, amount_cents, f"wd{rid}")
-    return cb_create_check(uid, amount_cents)
+    link = res.get("bot_check_url")
+    if link:
+        return True, link, "Чек создан"
+    log.error("CryptoBot check without link: %s", res)
+    return False, None, "ответ Crypto Bot без ссылки на чек"
 
 
 def cb_balances():
-    """(код, [(актив, доступно, на удержании)])."""
-    ok, res, err, code = cb_call("getBalance")
-    if not ok:
+    """(http_code, [(asset, available)])."""
+    res, err, code = cb_call("getBalance")
+    if err:
         return (code or 500), []
     out = []
-    for b in _cb_items(res):
+    for b in res or []:
         try:
-            out.append((str(b.get("currency_code") or "?"), float(b.get("available") or 0), float(b.get("onhold") or 0)))
+            out.append((str(b.get("currency_code") or "?"), float(b.get("available", 0) or 0)))
         except (TypeError, ValueError):
-            continue
+            pass
     return 200, out
 
 
-def cb_verify_signature(raw, headers):
-    """HMAC-SHA256 тела запроса, ключ — SHA256 от токена приложения. True/False, либо None, если проверить нечем."""
-    sig = headers.get("crypto-pay-api-signature")
-    if not sig or not CRYPTOBOT_TOKEN:
-        return None
-    key = hashlib.sha256(CRYPTOBOT_TOKEN.encode()).digest()
-    return hmac.compare_digest(hmac.new(key, raw, hashlib.sha256).hexdigest(), sig.strip().lower())
+PROVIDER_NAMES = {"xrocket": "🚀 xRocket", "cryptobot": "🤖 Crypto Bot"}
+PROV_CODE = {"x": "xrocket", "c": "cryptobot"}
 
 
-def providers():
-    """Подключённые платёжные системы: [(код, название)]."""
+def providers_available():
     out = []
     if XROCKET_TOKEN:
-        out.append(("xr", "🚀 xRocket"))
+        out.append("xrocket")
     if CRYPTOBOT_TOKEN:
-        out.append(("cb", "🤖 Crypto Bot"))
+        out.append("cryptobot")
     return out
 
 
-PROVIDER_NAMES = {"xr": "xRocket", "cb": "Crypto Bot"}
-
-
-# ───────────────────────── ВАГЕР ─────────────────────────
-def wager_req(amount):
-    """Сколько нужно отыграть после пополнения на amount."""
-    return int(amount * WD_TURNOVER_X)
-
-
-def credit_deposit_balance(conn, uid, amount):
-    """Зачисляет пополнение и добавляет вагер. Один SQL: проверка «вагер выполнен» идёт по старому значению."""
-    req = wager_req(amount)
-    conn.execute(
-        "UPDATE users SET balance=balance+?, "
-        "wager_total=CASE WHEN wager<=0 THEN ? ELSE wager_total+? END, wager=wager+? WHERE id=?",
-        (amount, req, req, req, uid),
-    )
-
-
-def deposited_total(uid):
-    return db.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM deposits WHERE user_id=? AND status='approved'", (uid,)
-    ).fetchone()[0]
-
-
-def withdraw_problem(uid):
-    """Причина, по которой вывод пока недоступен (или None)."""
-    if is_admin(uid):
-        return None
-    if deposited_total(uid) < WD_MIN_DEPOSITED:
-        return f"❌ Вывод доступен после пополнения баланса от {m(WD_MIN_DEPOSITED)}. Стартовый бонус не выводится."
-    left = get_user(uid)["wager"]
-    if left > 0:
-        return f"❌ Сначала отыграйте вагер: осталось {m(left)}. Посмотреть: команда «вагер»."
-    return None
+def provider_status(provider, invoice_id):
+    return cb_invoice_status(invoice_id) if provider == "cryptobot" else xr_invoice_status(invoice_id)
 
 
 # ───────────────────────── МЕНЮ ─────────────────────────
+HELP_TEXT = (
+    "🎰 <b>Как играть</b>\n\n"
+    "• <code>баланс</code> · <code>профиль</code> · <code>вагер</code> · <code>меню</code> · <code>игры</code>\n"
+    "• Ставка: <code>ставка 1.5</code> · на весь баланс: <code>вб</code>\n"
+    "• Игры текстом: <code>куб чет</code>, <code>дартс белый</code>, <code>слот 1 бар</code>, <code>слот 2 7</code>, "
+    "<code>краш 5</code>, <code>мины 3</code>, <code>башня</code>\n"
+    "• Перевод игроку: ответом на его сообщение <code>нк 1.5</code>\n"
+    "• Пополнение и вывод — в личных сообщениях с ботом."
+)
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    rows = []
+    if update.effective_chat.type != "private":
+        me = await ctx.bot.get_me()
+        rows = [[IB("💳 Пополнить / вывести (в личке)", url=f"https://t.me/{me.username}?start=pay")]]
+    await update.effective_message.reply_text(HELP_TEXT, reply_markup=IM(rows) if rows else None, parse_mode=HTML)
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
-        if await _gate(update):
-            await update.effective_message.reply_text(HELP_TEXT, parse_mode=HTML)
+        user = update.effective_user
+        if user and not user.is_bot and not (is_banned(user.id) and not is_admin(user.id)):
+            await cmd_help(update, ctx)
         return
     uid = update.effective_user.id
     if is_banned(uid) and not is_admin(uid):
@@ -814,123 +736,89 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def _fmt_asset(bal):
-    return f"{bal:.2f}" if bal >= 0.01 else f"{bal:.8f}".rstrip("0").rstrip(".") or "0"
+def _fmt_balances(items):
+    lines = []
+    for name, bal in items:
+        if bal > 0:
+            txt = f"{bal:.2f}" if bal >= 0.01 else f"{bal:.8f}".rstrip("0")
+            lines.append(f"• {txt} {name.lower()}")
+    return "\n".join(lines) if lines else "нет средств"
 
 
 async def cmd_kazna(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id) or update.effective_chat.type != "private":
+    if not is_admin(update.effective_user.id):
         return
-    if not providers():
-        await update.effective_message.reply_text("❌ Не задан ни XROCKET_TOKEN, ни CRYPTOBOT_TOKEN.")
+    msg = update.effective_message
+    if update.effective_chat.type != "private":
+        await msg.reply_text("🏦 Казну можно смотреть только в личных сообщениях с ботом.")
         return
-    blocks = []
-    if XROCKET_TOKEN:
+    if not providers_available():
+        await msg.reply_text("❌ Не задан ни XROCKET_TOKEN, ни CRYPTOBOT_TOKEN.")
+        return
+    parts = []
+    for prov, fn in (("xrocket", xr_balances), ("cryptobot", cb_balances)):
+        if prov not in providers_available():
+            continue
         try:
-            code, items = await asyncio.to_thread(xr_balances)
+            code, items = await asyncio.to_thread(fn)
         except Exception as e:
-            blocks.append(f"🚀 <b>xRocket:</b> ❌ {html.escape(str(e))[:150]}")
+            parts.append(f"<b>{PROVIDER_NAMES[prov]}:</b>\n❌ Ошибка: {html.escape(str(e))}")
+            continue
+        if code != 200:
+            parts.append(f"<b>{PROVIDER_NAMES[prov]}:</b>\n❌ Ошибка API: {code}")
         else:
-            if code != 200:
-                blocks.append(f"🚀 <b>xRocket:</b> ❌ ошибка {code}")
-            else:
-                lines = [f"• {_fmt_asset(b)} {n.lower()}" for n, b in items if b > 0]
-                blocks.append("🚀 <b>xRocket:</b>\n" + ("\n".join(lines) if lines else "• пусто"))
-    if CRYPTOBOT_TOKEN:
-        try:
-            code, items = await asyncio.to_thread(cb_balances)
-        except Exception as e:
-            blocks.append(f"🤖 <b>Crypto Bot:</b> ❌ {html.escape(str(e))[:150]}")
-        else:
-            if code != 200:
-                blocks.append(f"🤖 <b>Crypto Bot:</b> ❌ ошибка {code}")
-            else:
-                lines = []
-                for n, av, hold in items:
-                    if av > 0 or hold > 0:
-                        extra = f" (на удержании {_fmt_asset(hold)})" if hold > 0 else ""
-                        lines.append(f"• {_fmt_asset(av)} {n.lower()}{extra}")
-                blocks.append("🤖 <b>Crypto Bot:</b>\n" + ("\n".join(lines) if lines else "• пусто"))
-    owed = db.execute("SELECT COALESCE(SUM(balance),0) FROM users").fetchone()[0]
-    blocks.append(f"👥 Балансы игроков (долг казино): <b>{m(owed)}</b>")
-    await update.effective_message.reply_text("🏦 <b>Казна</b>\n\n" + "\n\n".join(blocks), parse_mode=HTML)
+            parts.append(f"<b>{PROVIDER_NAMES[prov]}:</b>\n{_fmt_balances(items)}")
+    await msg.reply_text("🏦 <b>Казна</b>\n\n" + "\n\n".join(parts), parse_mode=HTML)
+
+
+def approved_deposits(uid):
+    return db.execute(
+        "SELECT COALESCE(SUM(amount),0) FROM deposits WHERE user_id=? AND status='approved'", (uid,)
+    ).fetchone()[0]
+
+
+def withdraw_problem(uid):
+    """None — вывод доступен; иначе текст причины."""
+    if is_admin(uid):
+        return None
+    if approved_deposits(uid) < WD_MIN_DEPOSITED:
+        return f"❌ Вывод доступен после пополнения баланса от {m(WD_MIN_DEPOSITED)}. Стартовый бонус не выводится."
+    left = get_user(uid)["wager"]
+    if left > 0:
+        return f"❌ Сначала отыграйте вагер: осталось {m(left)}. Узнать остаток: «вагер»."
+    return None
+
+
+def wager_text(uid):
+    u = get_user(uid)
+    left = u["wager"]
+    lines = [
+        "🎯 <b>Вагер</b>",
+        f"💳 Пополнено всего: <b>{m(approved_deposits(uid))}</b>",
+        f"🎰 Осталось отыграть: <b>{m(left)}</b>",
+        "",
+        f"Вагер начисляется после пополнения (x{WAGER_X:g} от суммы)"
+        + (f" и при получении перевода (x{TRANSFER_WAGER_X:g})." if TRANSFER_WAGER_X > 0 else ".")
+        + " Каждая ставка уменьшает его на свою сумму. Пока он больше $0.00, вывод закрыт.",
+    ]
+    problem = withdraw_problem(uid)
+    lines.append("")
+    lines.append("✅ Вывод доступен." if problem is None else problem)
+    return "\n".join(lines)
+
+
+async def show_wager(update, ctx):
+    await respond(update, wager_text(update.effective_user.id), IM([[IB("💸 Вывести", callback_data="wd:start"), IB("🎮 Играть", callback_data="menu:play")]]))
 
 
 async def show_balance(update, ctx):
     u = get_user(update.effective_user.id)
-    kb = IM([pay_row(update, ctx), [IB("🎮 Играть", callback_data="menu:play"), IB("🎯 Вагер", callback_data="wg:show")]])
-    text = f"{who(update)}💰 <b>Баланс:</b> {m(u['balance'])}\n♻️ <b>Рейкбек:</b> {m(u['rakeback'])}"
-    if u["wager"] > 0:
-        text += f"\n🎯 <b>Осталось отыграть (вагер):</b> {m(u['wager'])}"
-    await respond(update, text, kb)
-
-
-async def show_wager(update, ctx):
-    uid = update.effective_user.id
-    u = get_user(uid)
-    dep = deposited_total(uid)
-    left, total = u["wager"], u["wager_total"]
-    done = max(0, total - left)
-    pct = 100 if total <= 0 else min(100, int(done * 100 / total))
-    bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-    lines = [
-        f"{who(update)}🎯 <b>Вагер</b>",
-        f"После каждого пополнения нужно отыграть сумму пополнения × <b>{WD_TURNOVER_X:g}</b> — тогда доступен вывод.",
-        "",
-        f"💳 Пополнено всего: <b>{m(dep)}</b>",
-    ]
-    if left > 0:
-        lines += [
-            f"📊 Отыграно: <b>{m(done)}</b> из <b>{m(total)}</b>",
-            f"{bar} {pct}%",
-            f"⏳ Осталось отыграть: <b>{m(left)}</b>",
-            "",
-            "🚫 Вывод пока недоступен.",
-        ]
-    elif dep < WD_MIN_DEPOSITED:
-        lines.append(f"Активного вагера нет. Вывод откроется после пополнения от {m(WD_MIN_DEPOSITED)}.")
-    else:
-        lines.append("✅ Вагер отыгран — вывод доступен.")
-    await respond(update, "\n".join(lines), IM([pay_row(update, ctx), [IB("⬅️ Меню", callback_data="menu:main")]]))
-
-
-HELP_TEXT = (
-    "🎰 <b>Команды</b> — можно писать прямо в чат\n\n"
-    "• <code>баланс</code> · <code>вагер</code> · <code>играть</code>\n"
-    "• <code>ставка 1.5</code> · <code>вб</code> (весь баланс)\n"
-    "• <code>куб чет</code> · <code>дартс белый</code> · <code>слот 1 бар</code> · <code>боулинг страйк</code>\n"
-    "• <code>краш 5</code> · <code>мины 3</code> · <code>башня старт</code>\n"
-    "• <code>нк 1.5</code> — ответом на сообщение игрока: перевод\n\n"
-    "💳 Пополнение и вывод — только в личке с ботом."
-)
-
-
-async def _gate(update):
-    u = update.effective_user
-    if u is None or u.is_bot or (is_banned(u.id) and not is_admin(u.id)):
-        return False
-    get_user(u.id)
-    return True
-
-
-async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await _gate(update):
-        await show_balance(update, ctx)
-
-
-async def cmd_play(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await _gate(update):
-        await show_games(update, ctx)
-
-
-async def cmd_wager(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await _gate(update):
-        await show_wager(update, ctx)
-
-
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await _gate(update):
-        await update.effective_message.reply_text(HELP_TEXT, parse_mode=HTML)
+    kb = IM([
+        [IB("💳 Пополнить", callback_data="dep:start"), IB("💸 Вывести", callback_data="wd:start")],
+        [IB("🎯 Вагер", callback_data="wager:show"), IB("🎮 Играть", callback_data="menu:play")],
+    ])
+    wl = f"\n🎯 <b>Вагер:</b> {m(u['wager'])}" if u["wager"] > 0 else ""
+    await respond(update, f"💰 <b>Баланс:</b> {m(u['balance'])}\n♻️ <b>Рейкбек:</b> {m(u['rakeback'])}{wl}", kb)
 
 
 async def show_menu(update, ctx):
@@ -940,8 +828,8 @@ async def show_menu(update, ctx):
     rows = [
         [IB("🎮 Играть", callback_data="menu:play"), IB("👤 Профиль", callback_data="menu:profile")],
         [IB("🎁 Ежедневный бонус", callback_data="daily:claim"), IB("👥 Рефералка", callback_data="ref:show")],
-        [IB("💬 Заработок в чате", callback_data="earn:show"), IB("🎯 Вагер", callback_data="wg:show")],
-        pay_row(update, ctx),
+        [IB("💬 Заработок в чате", callback_data="earn:show")],
+        [IB("💳 Пополнить", callback_data="dep:start"), IB("💸 Вывести", callback_data="wd:start")],
     ]
     links = []
     for r in db.execute("SELECT chat, kind FROM channels WHERE official=1 ORDER BY kind, rowid").fetchall():
@@ -952,7 +840,7 @@ async def show_menu(update, ctx):
     await respond(
         update,
         f"📋 <b>Меню</b>\n\n💰 Баланс: <b>{m(u['balance'])}</b>\n💵 Ставка: <b>{m(bet) if bet else 'не выбрана'}</b>\n\n"
-        "Быстрая ставка: <code>ставка 1.5</code> · на весь баланс: <code>вб</code> · вагер: <code>вагер</code>\n"
+        "Быстрая ставка: <code>ставка 1.5</code> · на весь баланс: <code>вб</code> · остаток вагера: <code>вагер</code>\n"
         "Перевод игроку: ответьте на его сообщение в чате: <code>нк 1.5</code>",
         IM(rows),
     )
@@ -1010,6 +898,24 @@ async def show_games(update, ctx):
     await respond(update, text, IM(rows))
 
 
+# простые текстовые команды (работают и в личке, и в группе); show_* объявлены выше
+SIMPLE_CMDS = {
+    "баланс": show_balance, "бал": show_balance, "профиль": show_profile, "вагер": show_wager,
+    "wager": show_wager, "меню": show_menu, "игры": show_games, "играть": show_games,
+}
+
+
+def _cmd(fn):
+    """Обёртка для /команд: игнорирует ботов и забаненных."""
+    async def handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        u = update.effective_user
+        if not u or u.is_bot or (is_banned(u.id) and not is_admin(u.id)):
+            return
+        get_user(u.id)
+        await fn(update, ctx)
+    return handler
+
+
 # ───────────────────────── ИГРЫ ─────────────────────────
 async def show_bet_menu(update, ctx, game):
     uid = update.effective_user.id
@@ -1045,9 +951,10 @@ async def next_step(update, ctx):
     if game == "slots":
         opts = DICE["slots"]["opts"]
         rows = []
-        for c, word in ((1, "1 раз"), (2, "2 раза")):
-            rows.append([IB(f"━ Символ выпадет ровно {word} · x{fm(SLOT_CNT_MULT[c])} ━", callback_data="noop")])
-            rows.append([IB(SLOT_NAMES[i], callback_data=f"p:slots:c{c}{SLOT_KEYS[i]}") for i in range(4)])
+        for n in (1, 2, 3):
+            kk = f"c{n}b"
+            rows.append([IB(f"━ Ровно {n} на 3 барабанах · x{fm(64 / len(opts[kk][1]))} ━", callback_data="noop")])
+            rows.append([IB(SLOT_NAMES[i], callback_data=f"p:slots:c{n}{SLOT_KEYS[i]}") for i in range(4)])
         rows.append([
             IB(f"Уникальные · x{fm(64 / len(opts['uniq'][1]))}", callback_data="p:slots:uniq"),
             IB(f"Три одинак. · x{fm(64 / len(opts['tri'][1]))}", callback_data="p:slots:tri"),
@@ -1056,9 +963,8 @@ async def next_step(update, ctx):
         rows.append(chg)
         await respond(
             update,
-            who(update) + head + "Выберите символ и сколько раз он выпадет на <b>трёх барабанах</b>.\n"
-            "Например «1 BAR» — ровно один BAR; если BAR выпадет 2 или 3 раза, ставка проиграна.\n"
-            "Текстом: <code>слот 1 бар</code>, <code>слот 2 7</code>.",
+            head + "Выберите символ и сколько раз он должен выпасть на 3 барабанах. "
+            "Если выпало другое количество — проигрыш.\n<i>Текстом: «слот 1 бар», «слот 2 7»</i>",
             IM(rows),
         )
     elif game in DICE:
@@ -1107,7 +1013,6 @@ async def play_dice(update, ctx, game, key, two=False):
     cfg = DICE.get(game)
     if not cfg or not bet:
         return "Ошибка ставки"
-    fixed = False
     if two:
         multi = MULTI.get(game)
         if not multi or key not in multi:
@@ -1120,8 +1025,7 @@ async def play_dice(update, ctx, game, key, two=False):
         if key not in cfg["opts"]:
             return "Ошибка ставки"
         label, vals = cfg["opts"][key]
-        fixed = game == "slots" and key in SLOT_FIXED
-        mult = SLOT_FIXED[key] if fixed else cfg["n"] / len(vals)
+        mult = cfg["n"] / len(vals)
         title, log_game, rolls = GAME_TITLES[game], game, 1
     if uid in BUSY:
         return "Подождите ⏳"
@@ -1138,7 +1042,7 @@ async def play_dice(update, ctx, game, key, two=False):
         )
         db.commit()
         status = (
-            who(update) + f"<b>{title}</b>\n💵 Ставка: <b>{m(bet)}</b>\n🎯 Исход: <b>{html.escape(label, quote=False)}</b> (x{fm(mult)})\n\n⏳ Бросаем..."
+            f"<b>{title}</b>\n💵 Ставка: <b>{m(bet)}</b>\n🎯 Исход: <b>{html.escape(label, quote=False)}</b> (x{fm(mult)})\n\n⏳ Бросаем..."
         )
         if q:
             await q.answer()
@@ -1151,7 +1055,7 @@ async def play_dice(update, ctx, game, key, two=False):
         await asyncio.sleep(4)
         values = [x.dice.value for x in msgs]
         win = (tuple(values) in vals) if two else (values[0] in vals)
-        payout = calc(bet, mult, fee=not fixed) if win else 0
+        payout = calc(bet, mult) if win else 0
         if game == "slots":
             shown = " ".join(SLOT_NAMES[i] for i in slot_reels(values[0]))
         else:
@@ -1163,15 +1067,16 @@ async def play_dice(update, ctx, game, key, two=False):
         else:
             res = f"😔 <b>Проигрыш</b>\n💸 −{m(bet)}"
         text = (
-            who(update) + f"<b>{title}</b>\n🎯 Ваш исход: <b>{html.escape(label, quote=False)}</b>\n🎲 Выпало: <b>{shown}</b>\n\n{res}\n\n"
+            f"<b>{title}</b>\n🎯 Ваш исход: <b>{html.escape(label, quote=False)}</b>\n🎲 Выпало: <b>{shown}</b>\n\n{res}\n\n"
             f"💰 Баланс: <b>{m(get_user(uid)['balance'])}</b>"
         )
         repeat_cb = f"q:{game}:{key}" if two else f"p:{game}:{key}"
-        await send_new(update, ctx, text, IM(end_rows(repeat_cb, game, bet=bet)))
+        sent = await ctx.bot.send_message(chat_id, text, reply_markup=IM(end_rows(repeat_cb, game, bet=bet)), parse_mode=HTML)
+        track_msg(sent, uid)
     except Exception:
         if paid and not settled:
             db.execute("DELETE FROM pending_bets WHERE user_id=?", (uid,))
-            add_balance(uid, bet)
+            refund_bet(uid, bet)
         raise
     finally:
         BUSY.discard(uid)
@@ -1425,70 +1330,91 @@ async def tower_click(update, ctx, arg):
 
 
 # ───────────────────────── ПОПОЛНЕНИЕ / ВЫВОД ─────────────────────────
+async def ask_provider(update, kind, amount):
+    """Если подключено несколько платёжек — спрашиваем, какой пользоваться."""
+    code = "dp" if kind == "dep" else "wp"
+    rows = [[IB(PROVIDER_NAMES[p], callback_data=f"{code}:{'x' if p == 'xrocket' else 'c'}:{amount}")] for p in providers_available()]
+    what = "пополнения" if kind == "dep" else "вывода"
+    await update.effective_message.reply_text(
+        f"Выберите способ {what} на <b>{m(amount)}</b>:", reply_markup=IM(rows), parse_mode=HTML,
+    )
+
+
 async def create_deposit(update, ctx, amount, provider=None):
     uid = update.effective_user.id
     msg = update.effective_message
-    ps = providers()
-    if not ps:
+    provs = providers_available()
+    if not provs:
         await msg.reply_text("❌ Пополнение сейчас недоступно: не подключена платёжная система.")
         return
     if provider is None:
-        if len(ps) == 1:
-            provider = ps[0][0]
-        else:
-            # подключено несколько систем — даём выбрать; сумма уходит в callback_data
-            await msg.reply_text(
-                f"💳 Пополнение на <b>{m(amount)}</b>. Выберите способ оплаты:",
-                reply_markup=IM([[IB(name, callback_data=f"dp:{k}:{amount}") for k, name in ps]]),
-                parse_mode=HTML,
-            )
+        if len(provs) > 1:
+            await ask_provider(update, "dep", amount)
             return
-    if provider not in dict(ps):
-        await msg.reply_text("❌ Этот способ пополнения недоступен.")
+        provider = provs[0]
+    if provider not in provs:
+        await msg.reply_text("❌ Этот способ сейчас недоступен.")
         return
-    if provider == "cb":
+    if provider == "cryptobot":
         ok, link, invoice_id, err = await asyncio.to_thread(cb_create_invoice, uid, amount)
     else:
         ok, link, invoice_id, err = await asyncio.to_thread(xr_create_invoice, uid, amount)
     if not ok:
         await msg.reply_text(f"❌ Не удалось создать счёт: {err}")
         return
-    # invoice_id сохраняется ДО выдачи ссылки — по нему вебхук найдёт депозит
+    # invoice_id сохраняется ДО выдачи ссылки — по нему вебхук/опрос найдёт депозит
     db.execute(
         "INSERT INTO deposits(user_id, amount, status, invoice_id, ts, provider) VALUES(?,?,?,?,?,?)",
         (uid, amount, "pending", str(invoice_id), int(time.time()), provider),
     )
     db.commit()
-    req = wager_req(amount)
     await msg.reply_text(
         f"💳 <b>Счёт на {m(amount)}</b> · {PROVIDER_NAMES[provider]}\nОплатите — баланс пополнится автоматически.\n"
-        f"🎯 После пополнения нужно отыграть <b>{m(req)}</b> для вывода (проверить: «вагер»).",
+        f"🎯 После пополнения нужно будет отыграть {m(int(amount * WAGER_X))} (команда «вагер»).",
         reply_markup=IM([[IB("💳 Оплатить", url=link)]]), parse_mode=HTML,
     )
 
 
-async def create_withdraw(update, ctx, amount):
+async def create_withdraw(update, ctx, amount, provider=None):
     uid = update.effective_user.id
+    msg = update.effective_message
     problem = withdraw_problem(uid)
     if problem:
-        await update.effective_message.reply_text(problem)
+        await msg.reply_text(problem)
+        return
+    if get_user(uid)["balance"] < amount:
+        await msg.reply_text("❌ Недостаточно средств.")
+        return
+    provs = providers_available()
+    if not provs:
+        await msg.reply_text("❌ Вывод сейчас недоступен: не подключена платёжная система.")
+        return
+    if provider is None:
+        if len(provs) > 1:
+            await ask_provider(update, "wd", amount)
+            return
+        provider = provs[0]
+    if provider not in provs:
+        await msg.reply_text("❌ Этот способ сейчас недоступен.")
         return
     c = db.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?", (amount, uid, amount))
     db.commit()
     if c.rowcount != 1:
-        await update.effective_message.reply_text("❌ Недостаточно средств.")
+        await msg.reply_text("❌ Недостаточно средств.")
         return
     cur = db.execute(
-        "INSERT INTO withdrawals(user_id, amount, status, ts) VALUES(?,?,?,?)",
-        (uid, amount, "pending", int(time.time())),
+        "INSERT INTO withdrawals(user_id, amount, status, ts, provider) VALUES(?,?,?,?,?)",
+        (uid, amount, "pending", int(time.time()), provider),
     )
     db.commit()
-    await update.effective_message.reply_text(
-        f"💸 <b>Заявка на вывод #{cur.lastrowid} на {m(amount)}</b>\nОжидайте.", parse_mode=HTML,
+    await msg.reply_text(
+        f"💸 <b>Заявка на вывод #{cur.lastrowid} на {m(amount)}</b> · {PROVIDER_NAMES[provider]}\nОжидайте.", parse_mode=HTML,
     )
     try:
         await ctx.bot.send_message(
-            ADMIN_ID, f"🔔 Вывод #{cur.lastrowid}: {m(amount)} от <code>{uid}</code>. /admin", parse_mode=HTML,
+            ADMIN_ID,
+            f"🔔 Вывод #{cur.lastrowid}: {m(amount)} ({PROVIDER_NAMES[provider]}) от <code>{uid}</code>. /admin",
+            parse_mode=HTML,
         )
     except Exception:
         log.exception("Не удалось уведомить админа о выводе")
@@ -1506,19 +1432,15 @@ ADMIN_KB = IM([
 
 def adm_kb(kind, rid):
     if kind == "wd":
-        pay = []
-        if XROCKET_TOKEN:
-            pay.append(IB("✅ xRocket", callback_data=f"adm:wok:{rid}"))
-        if CRYPTOBOT_TOKEN:
-            pay.append(IB("✅ Crypto Bot", callback_data=f"adm:wcb:{rid}"))
-        rows = [pay] if pay else []
-        rows.append([IB("❌ Отклонить", callback_data=f"adm:wno:{rid}"), IB("✍️ Выплачено вручную", callback_data=f"adm:wman:{rid}")])
-        return IM(rows)
+        return IM([
+            [IB("✅ Одобрить (чек)", callback_data=f"adm:wok:{rid}"), IB("❌ Отклонить", callback_data=f"adm:wno:{rid}")],
+            [IB("✍️ Выплачено вручную", callback_data=f"adm:wman:{rid}")],
+        ])
     return IM([[IB("✅ Одобрить", callback_data=f"adm:dok:{rid}"), IB("❌ Отклонить", callback_data=f"adm:dno:{rid}")]])
 
 
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id) or update.effective_chat.type != "private":
+    if not is_admin(update.effective_user.id):
         return
     ctx.user_data.pop("await", None)
     await update.message.reply_text("🛠 <b>Админ-панель</b>", reply_markup=ADMIN_KB, parse_mode=HTML)
@@ -1560,11 +1482,10 @@ async def cb_admin(update, ctx, parts):
         for r in rows:
             await q.message.reply_text(
                 f"{'💸 Вывод' if act == 'wd' else '💳 Пополнение'} #{r['id']}\n"
-                f"Игрок: {r['user_id']}\nСумма: {m(r['amount'])}"
-                + (f"\nСистема: {PROVIDER_NAMES.get(r['provider'], r['provider'])}" if act == "dep" else ""),
+                f"Игрок: {r['user_id']}\nСумма: {m(r['amount'])}\nСпособ: {PROVIDER_NAMES.get(r['provider'], r['provider'])}",
                 reply_markup=adm_kb(act, r["id"]),
             )
-    elif act in ("wok", "wcb", "wno", "wman", "dok", "dno"):
+    elif act in ("wok", "wno", "wman", "dok", "dno"):
         return await admin_process(update, ctx, act, int(parts[2]))
     elif act == "subs":
         await show_subs(update)
@@ -1667,36 +1588,29 @@ async def admin_process(update, ctx, action, rid):
     user_msg = None
     user_kb = None
 
-    if action in ("wok", "wcb"):
-        prov = "xr" if action == "wok" else "cb"
+    if action == "wok":
         try:
-            if prov == "xr":
-                ok, link, info = await asyncio.to_thread(xr_create_cheque, uid, amount)
-            else:
-                ok, link, info = await asyncio.to_thread(cb_payout, uid, amount, rid)
+            cheque_fn = cb_create_check if r["provider"] == "cryptobot" else xr_create_cheque
+            ok, link, info = await asyncio.to_thread(cheque_fn, uid, amount)
         except Exception as e:
-            log.exception("Ошибка при создании выплаты")
+            log.exception("Ошибка при создании чека")
             ok, link, info = False, None, f"внутренняя ошибка: {e}"
         if not ok:
-            # выплата не создана — заявка остаётся в ожидании, баланс игрока не трогаем
+            # чек не создан — заявка остаётся в ожидании, баланс игрока не трогаем
             db.execute(f"UPDATE {table} SET status='pending' WHERE id=?", (rid,))
             db.commit()
             try:
                 await q.edit_message_text(
-                    f"{base_text}\n\n⚠️ Выплата НЕ создана ({PROVIDER_NAMES[prov]}): {info}\n"
-                    f"Заявка осталась в ожидании: повторите, выберите другую систему, отклоните (вернёт деньги) или выплатите вручную.",
+                    f"{base_text}\n\n⚠️ Чек НЕ создан: {info}\n"
+                    f"Заявка осталась в ожидании: повторите, отклоните (вернёт деньги) или выплатите вручную.",
                     reply_markup=adm_kb("wd", rid),
                 )
             except Exception:
                 pass
-            return "❌ Выплата не создана, см. сообщение"
-        db.execute("UPDATE withdrawals SET provider=? WHERE id=?", (prov, rid))
-        note = f"✅ Вывод #{rid} одобрен ({PROVIDER_NAMES[prov]})."
-        if link:
-            user_msg = f"💸 Вывод на {m(amount)} одобрен!\nПолучите средства:"
-            user_kb = IM([[IB("🎁 Получить", url=link)]])
-        else:
-            user_msg = f"💸 Вывод на {m(amount)} одобрен — средства отправлены на ваш аккаунт Crypto Bot."
+            return "❌ Чек не создан, см. сообщение"
+        note = f"✅ Вывод #{rid} одобрен, чек создан."
+        user_msg = f"💸 Вывод на {m(amount)} одобрен!\nПолучите средства:"
+        user_kb = IM([[IB("🎁 Получить", url=link)]])
     elif action == "wman":
         note = f"✅ Вывод #{rid} отмечен как выплаченный вручную."
         user_msg = f"💸 Вывод #{rid} на {m(amount)} одобрен. Средства отправлены."
@@ -1706,7 +1620,8 @@ async def admin_process(update, ctx, action, rid):
         note = f"❌ Вывод #{rid} отклонён, {m(amount)} возвращены на баланс."
         user_msg = note
     elif action == "dok":
-        credit_deposit_balance(db, uid, amount)  # коммит — вместе со сменой статуса ниже
+        db.execute("UPDATE users SET balance=balance+?, wager=wager+? WHERE id=?", (amount, int(amount * WAGER_X), uid))
+        db.commit()
         note = f"✅ Пополнение #{rid} подтверждено."
         user_msg = f"✅ На ваш баланс зачислено {m(amount)}!"
     else:
@@ -1738,8 +1653,7 @@ EARN_LAST = {}
 DAILY_STEPS = [5, 10, 15, 20, 25, 30, 50]          # центы по дням серии
 REF_BP = int(os.environ.get("REF_BP", "50"))       # реферал: 50 = 0.5% оборота приглашённого
 REF_MIN = 10                                       # мин. вывод рефбонуса, центы
-POLL = {"until": 0}
-POLL_CB = {"until": 0}
+POLL = {"xrocket": 0, "cryptobot": 0}
 
 
 def sget(key):
@@ -2062,7 +1976,7 @@ async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ───────────────────────── ПРОВЕРКА ОПЛАТЫ БЕЗ ВЕБХУКА ─────────────────────────
-def close_deposit(invoice_id, status, provider="xr"):
+def close_deposit(invoice_id, status, provider="xrocket"):
     """Закрывает неоплаченный счёт (истёк/отменён), чтобы не опрашивать его вечно."""
     conn = sqlite3.connect(DB_PATH, timeout=15)
     try:
@@ -2075,78 +1989,55 @@ def close_deposit(invoice_id, status, provider="xr"):
         conn.close()
 
 
-def _pending_rows(provider, now, limit):
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
-    try:
-        # сначала самые свежие: старые брошенные счета не должны заслонять новые платежи
-        return conn.execute(
-            "SELECT * FROM deposits WHERE status='pending' AND provider=? AND invoice_id IS NOT NULL AND ts<? "
-            "ORDER BY id DESC LIMIT ?", (provider, now - 30, limit),
-        ).fetchall()
-    finally:
-        conn.close()
-
-
 def poll_deposits_sync():
     """Опрашивает неоплаченные счета в xRocket и Crypto Bot. Возвращает [(user_id, amount)] зачисленных."""
-    now = int(time.time())
-    if not providers():
+    provs = providers_available()
+    if not provs:
         return []
+    now = int(time.time())
+    done = []
     conn = sqlite3.connect(DB_PATH, timeout=15)
     try:
         conn.execute("UPDATE deposits SET status='expired' WHERE status='pending' AND ts<?", (now - 7 * 86400,))
         conn.commit()
     finally:
         conn.close()
-    done = []
-
-    if XROCKET_TOKEN and now >= POLL["until"]:
-        for r in _pending_rows("xr", now, 20):
-            status, code = xr_invoice_status(r["invoice_id"])
+    for prov in provs:
+        if time.time() < POLL[prov]:
+            continue
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        conn.row_factory = sqlite3.Row
+        try:
+            # сначала самые свежие: старые брошенные счета не должны заслонять новые платежи
+            rows = conn.execute(
+                "SELECT * FROM deposits WHERE status='pending' AND invoice_id IS NOT NULL AND provider=? AND ts<? "
+                "ORDER BY id DESC LIMIT 20", (prov, now - 30),
+            ).fetchall()
+        finally:
+            conn.close()
+        for r in rows:
+            status, code = provider_status(prov, r["invoice_id"])
             if code == 401:
-                log.error("Опрос xRocket: 401, неверный XROCKET_TOKEN. Пауза 10 минут")
-                POLL["until"] = now + 600
+                log.error("Опрос счетов %s: 401, неверный токен. Пауза 10 минут", prov)
+                POLL[prov] = now + 600
                 break
             if code == 429:
-                log.warning("Опрос xRocket: 429, пауза 2 минуты")
-                POLL["until"] = now + 120
+                log.warning("Опрос счетов %s: 429, пауза 2 минуты", prov)
+                POLL[prov] = now + 120
                 break
             if code == 405:
-                log.warning("Опрос xRocket: метод недоступен (405), пауза на час; зачисление идёт через вебхук")
-                POLL["until"] = now + 3600
+                log.warning("Опрос счетов %s: метод недоступен (405), пауза на час; зачисление идёт через вебхук", prov)
+                POLL[prov] = now + 3600
                 break
             if status is None:
                 continue  # сеть / 404 / 5xx — попробуем в следующий раз
             if status == "paid":
-                uid, amount, res = credit_deposit(r["invoice_id"], "xr")
+                uid, amount, res = credit_deposit(r["invoice_id"], prov)
                 if res == "ok":
-                    log.info("Автозачисление xRocket (опрос): user %s +%s", uid, m(amount))
+                    log.info("Автозачисление (опрос, %s): user %s +%s", prov, uid, m(amount))
                     done.append((uid, amount))
             elif status in ("expired", "cancelled"):
-                close_deposit(r["invoice_id"], status, "xr")
-
-    if CRYPTOBOT_TOKEN and now >= POLL_CB["until"]:
-        rows = _pending_rows("cb", now, 50)
-        if rows:
-            statuses, code = cb_invoice_statuses([r["invoice_id"] for r in rows])
-            if statuses is None:
-                if code == 401:
-                    log.error("Опрос Crypto Bot: 401, неверный CRYPTOBOT_TOKEN. Пауза 10 минут")
-                    POLL_CB["until"] = now + 600
-                elif code == 429:
-                    log.warning("Опрос Crypto Bot: 429, пауза 2 минуты")
-                    POLL_CB["until"] = now + 120
-            else:
-                for r in rows:
-                    status = statuses.get(str(r["invoice_id"]))
-                    if status == "paid":
-                        uid, amount, res = credit_deposit(r["invoice_id"], "cb")
-                        if res == "ok":
-                            log.info("Автозачисление Crypto Bot (опрос): user %s +%s", uid, m(amount))
-                            done.append((uid, amount))
-                    elif status == "expired":
-                        close_deposit(r["invoice_id"], "expired", "cb")
+                close_deposit(r["invoice_id"], status, prov)
     return done
 
 
@@ -2202,46 +2093,42 @@ def claim_ref(uid):
 
 
 # ───────────────────────── ПЕРЕВОДЫ «нк» ─────────────────────────
+def transfer_problem(uid):
+    """Переводы не требуют пополнений. Единственное необязательное ограничение — TRANSFER_MIN_TURNOVER (по умолчанию 0)."""
+    if is_admin(uid) or not TRANSFER_MIN_TURNOVER:
+        return None
+    turn = get_user(uid)["turnover"]
+    if turn < TRANSFER_MIN_TURNOVER:
+        return f"❌ Переводы откроются после оборота {m(TRANSFER_MIN_TURNOVER)} (сейчас {m(turn)})."
+    return None
+
+
 async def do_transfer(update, ctx, amt):
     msg = update.effective_message
     sender = update.effective_user
-    target = msg.reply_to_message.from_user if msg.reply_to_message else None
+    target = msg.reply_to_message.from_user
     if target is None or target.is_bot or target.id == sender.id:
         await msg.reply_text("❌ Нельзя передать этому пользователю.")
         return
     if is_banned(target.id):
         await msg.reply_text("❌ Получатель заблокирован.")
         return
-    s_row = get_user(sender.id)
-    get_user(target.id)  # получатель без аккаунта создаётся автоматически — запускать бота заранее не нужно
-    if TRANSFER_NODEP_DAILY > 0 and not is_admin(sender.id) and deposited_total(sender.id) == 0:
-        sent = db.execute(
-            "SELECT COALESCE(SUM(amount),0) FROM transfers WHERE from_id=? AND ts>?", (sender.id, int(time.time()) - 86400)
-        ).fetchone()[0]
-        if sent + amt > TRANSFER_NODEP_DAILY:
-            await msg.reply_text(
-                f"❌ Без пополнений можно переводить до {m(TRANSFER_NODEP_DAILY)} в сутки (уже {m(sent)})."
-            )
-            return
+    get_user(sender.id)
+    get_user(target.id)  # получателю аккаунт создаётся сам — запускать бота заранее не нужно
+    problem = transfer_problem(sender.id)
+    if problem:
+        await msg.reply_text(problem)
+        return
+    wager_add = int(amt * TRANSFER_WAGER_X)
     cur = db.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?", (amt, sender.id, amt))
     if cur.rowcount != 1:
         db.rollback()
         await msg.reply_text("❌ Недостаточно средств.")
         return
-    # вагер «едет» вместе с деньгами: иначе его можно было бы обойти через второй аккаунт
-    carry = min(s_row["wager"], amt)
-    if carry > 0:
-        db.execute(
-            "UPDATE users SET wager=wager-?, wager_total=MAX(0, wager_total-?) WHERE id=?", (carry, carry, sender.id)
-        )
-    db.execute(
-        "UPDATE users SET balance=balance+?, "
-        "wager_total=CASE WHEN wager<=0 THEN ? ELSE wager_total+? END, wager=wager+? WHERE id=?",
-        (amt, carry, carry, carry, target.id),
-    )
+    db.execute("UPDATE users SET balance=balance+?, wager=wager+? WHERE id=?", (amt, wager_add, target.id))
     db.execute("INSERT INTO transfers(from_id, to_id, amount, ts) VALUES(?,?,?,?)", (sender.id, target.id, amt, int(time.time())))
     db.commit()
-    note = f"\n🎯 Вместе с деньгами передан вагер {m(carry)}" if carry > 0 else ""
+    note = f"\n🎯 Получателю добавлен вагер {m(wager_add)}." if wager_add > 0 else ""
     await msg.reply_text(
         f"✅ {html.escape(sender.full_name)} передал(а) {html.escape(target.full_name)} <b>{m(amt)}</b>{note}",
         parse_mode=HTML,
@@ -2332,23 +2219,15 @@ async def count_chat_message(update, ctx, text):
     db.commit()
 
 
-def apply_custom_bet(ctx, uid, amt):
-    db.execute("UPDATE users SET custom_bet=? WHERE id=?", (amt, uid))
-    db.commit()
-    set_bet(ctx, uid, amt)
-
-
 async def on_group_text(update, ctx):
-    """Чат: те же игры и команды, что и в личке, кроме пополнения/вывода (они только в личке)."""
     msg = update.effective_message
     user = update.effective_user
     chat = update.effective_chat
     text = (msg.text or "").strip()
     if not user or user.is_bot or is_banned(user.id):
         return
-    low = text.lower()
-
-    mt = re.fullmatch(r"нк\s+([\d.,]+)\$?", low)
+    low = text.lower().replace("ё", "е")
+    mt = re.fullmatch(r"нк\s*([\d.,]+)\$?", low)
     if mt:
         if not msg.reply_to_message:
             await msg.reply_text("Ответьте командой «нк 1.5» на сообщение игрока.")
@@ -2363,28 +2242,11 @@ async def on_group_text(update, ctx):
         if chat_is_official(chat):
             await msg.reply_text(top_text(day_str()), parse_mode=HTML)
         return
-    if low == "вагер":
+    fn = SIMPLE_CMDS.get(low)
+    if fn:
         get_user(user.id)
-        await show_wager(update, ctx)
+        await fn(update, ctx)
         return
-    if low in ("баланс", "бал"):
-        get_user(user.id)
-        await show_balance(update, ctx)
-        return
-    if low in ("играть", "игры", "игра", "меню"):
-        get_user(user.id)
-        await (show_menu(update, ctx) if low == "меню" else show_games(update, ctx))
-        return
-    if low in ("помощь", "команды"):
-        await msg.reply_text(HELP_TEXT, parse_mode=HTML)
-        return
-    if re.fullmatch(r"(деп|пополнить|вывод)(\s+[\d.,]+\$?)?", low):
-        await msg.reply_text(
-            "💳 Пополнение и вывод — только в личных сообщениях с ботом.",
-            reply_markup=IM([[IB("Открыть бота", url=dm_link(ctx))]]),
-        )
-        return
-
     mt = re.fullmatch(r"ставка\s+([\d.,]+)\$?", low)
     if mt:
         amt = parse_amount(mt.group(1))
@@ -2392,8 +2254,13 @@ async def on_group_text(update, ctx):
             await msg.reply_text(f"Ставка от {m(MIN_BET)} до {m(MAX_BET)}")
             return
         get_user(user.id)
-        apply_custom_bet(ctx, user.id, amt)
-        await msg.reply_text(f"⭐ Ставка: <b>{m(amt)}</b>", parse_mode=HTML)
+        db.execute("UPDATE users SET custom_bet=? WHERE id=?", (amt, user.id))
+        db.commit()
+        set_bet(ctx, user.id, amt)
+        await msg.reply_text(
+            f"⭐ Ставка: <b>{m(amt)}</b>\nИграйте текстом: <code>куб чет</code>, <code>слот 1 бар</code>, <code>краш 5</code>… (<code>/help</code>)",
+            parse_mode=HTML,
+        )
         return
     if low == "вб":
         u = get_user(user.id)
@@ -2404,18 +2271,6 @@ async def on_group_text(update, ctx):
         set_bet(ctx, user.id, amt)
         await msg.reply_text(f"💰 Ва-банк: <b>{m(amt)}</b>", parse_mode=HTML)
         return
-    if ctx.user_data.get("await") == "bet" and re.fullmatch(r"[\d.,]+\$?", low):
-        u = get_user(user.id)
-        amt = parse_amount(low)
-        err = check_bet(amt, u["balance"]) if amt else f"Ставка от {m(MIN_BET)} до {m(MAX_BET)}"
-        if err:
-            await msg.reply_text(err)
-        else:
-            set_bet(ctx, user.id, amt)
-            ctx.user_data.pop("await", None)
-            await next_step(update, ctx)
-        return
-
     if await try_text_bet(update, ctx, text, group=True):
         return
     await count_chat_message(update, ctx, text)
@@ -2769,20 +2624,6 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if (q.data or "").startswith("ct:"):
         await cb_contest_join(update, ctx)
         return
-    data = q.data or ""
-    owner = None
-    if "#" in data:  # в группах кнопки привязаны к игроку: «данные#id»
-        data, _, tail = data.rpartition("#")
-        try:
-            owner = int(tail)
-        except ValueError:
-            owner = None
-    if owner is not None and owner != uid:
-        try:
-            await q.answer("Это меню другого игрока. Откройте своё: напишите «играть»", show_alert=True)
-        except BadRequest:
-            pass
-        return
     get_user(uid)
     if is_banned(uid) and not is_admin(uid):
         try:
@@ -2790,6 +2631,16 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except BadRequest:
             pass
         return
+    data = q.data or ""
+    in_group = q.message is not None and getattr(q.message.chat, "type", "private") != "private"
+    if in_group and data != "noop":
+        owner = MSG_OWNER.get((q.message.chat_id, q.message.message_id))
+        if owner and owner != uid:
+            try:
+                await q.answer("🚫 Это чужое меню. Напишите «игры» или «меню», чтобы открыть своё.", show_alert=True)
+            except BadRequest:
+                pass
+            return
     mod = None
     if data.endswith("@h") or data.endswith("@d"):
         mod, data = data[-1], data[:-2]
@@ -2862,7 +2713,9 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     ctx.user_data.pop("game", None)
                 else:
                     ctx.user_data["game"] = game
-                if val == "in":
+                if val == "in" and in_group:
+                    res = "В чате напишите: ставка 1.5"
+                elif val == "in":
                     ctx.user_data["await"] = "bet"
                     await respond(update, "Введите сумму ставки (например, 1.5):", IM([[IB("⬅️ Назад", callback_data=f"gs:{game}")]]))
                 else:
@@ -2940,25 +2793,32 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 db.commit()
                 res = f"♻️ Рейкбек {m(u['rakeback'])} зачислен!"
                 await show_profile(update, ctx)
-        elif t == "wg":
+        elif t == "wager":
             await show_wager(update, ctx)
-        elif t in ("dep", "wd", "dp") and is_group(update):
-            res = "Пополнение и вывод доступны только в личке с ботом"
+        elif t in ("dep", "wd") and in_group:
+            res = "💳 Пополнение и вывод — в личных сообщениях с ботом"
         elif t == "dep":
             ctx.user_data["await"] = "dep"
             await q.message.reply_text(f"Введите сумму пополнения (мин. {m(MIN_TX)}):")
         elif t == "wd":
             ctx.user_data["await"] = "wd"
             await q.message.reply_text(f"Введите сумму вывода (мин. {m(MIN_TX)}):")
-        elif t == "dp":
-            try:
-                amt = int(parts[2])
-            except (ValueError, IndexError):
-                amt = 0
-            if len(parts) > 2 and parts[1] in ("xr", "cb") and MIN_TX <= amt <= 10**8:
-                await create_deposit(update, ctx, amt, parts[1])
+        elif t in ("dp", "wp"):
+            prov = PROV_CODE.get(parts[1])
+            amount = int(parts[2])
+            if in_group:
+                res = "💳 Пополнение и вывод — в личных сообщениях с ботом"
+            elif prov not in providers_available() or amount < MIN_TX:
+                res = "Этот способ сейчас недоступен"
             else:
-                res = "Ошибка"
+                try:
+                    await q.edit_message_reply_markup(reply_markup=None)  # от двойного нажатия
+                except BadRequest:
+                    pass
+                if t == "dp":
+                    await create_deposit(update, ctx, amount, prov)
+                else:
+                    await create_withdraw(update, ctx, amount, prov)
         elif t == "adm":
             res = await cb_admin(update, ctx, parts)
     except Exception:
@@ -3022,14 +2882,15 @@ TEXT_ONE = {
 }
 
 _SLOT_SYN = {
-    "s": ["7", "семерка", "семерки", "семерку", "семь"], "g": ["виноград", "виногр", "ягода", "ягоды"],
-    "l": ["лимон", "лемон"], "b": ["бар", "bar"],
+    "s": ["7", "семерка", "семерки", "семерку", "семь", "семерок"], "g": ["виноград", "винограда", "виноградов"],
+    "l": ["лимон", "лемон", "лимона", "лимонов"], "b": ["бар", "bar", "бара", "баров", "бары"],
 }
 _slots_text = {}
-for _c in (1, 2):  # «слот 1 бар» — ровно один BAR на трёх барабанах, «слот 2 7» — ровно две семёрки
+for _n in (1, 2, 3):
     for _k, _syns in _SLOT_SYN.items():
         for _sy in _syns:
-            _slots_text[f"{_c} {_sy}"] = f"c{_c}{_k}"
+            _slots_text[f"{_n} {_sy}"] = f"c{_n}{_k}"   # «1 бар»
+            _slots_text[f"{_sy} {_n}"] = f"c{_n}{_k}"   # «бар 1»
 _slots_text.update({
     "уникальные": "uniq", "уникальный": "uniq", "разные": "uniq", "уникальные символы": "uniq",
     "три": "tri", "тройка": "tri", "три одинаковых": "tri", "777": "jp", "джекпот": "jp",
@@ -3062,15 +2923,15 @@ TEXT_TWO = {
 
 
 async def try_text_bet(update, ctx, text, group=False):
-    """Ставки текстом: «куб оба нечет», «дартс белый», «слот 1 бар», «башня старт», «мины 3», «краш 5».
-    group=True — режим чата: незнакомые фразы молча игнорируются, чтобы обычная болтовня не запускала игры."""
-    text = text.replace("7️⃣", "7").replace("🍇", "виноград").replace("🍋", "лимон")
+    """Ставки текстом: «куб оба нечет», «дартс белый», «боулинг 1/6», «башня», «мины 3», «краш 5»."""
     t = _norm(text)
     first, _, rest = t.partition(" ")
     game = TEXT_GAMES.get(first)
     if not game:
         return False
     rest = rest.strip()
+    uid = update.effective_user.id
+    msg = update.effective_message
 
     action = None
     if game == "crash":
@@ -3082,24 +2943,21 @@ async def try_text_bet(update, ctx, text, group=False):
         if mm and 2 <= int(mm.group(1)) <= 12:
             action = ("mines", int(mm.group(1)))
     elif game == "tower":
-        if rest in ("старт", "начать") or (rest == "" and not group):
+        if rest in ("", "старт", "начать"):
             action = ("tower",)
     else:
         if game in TEXT_TWO and rest in TEXT_TWO[game]:
             action = ("roll", game, TEXT_TWO[game][rest], True)
         elif rest in TEXT_ONE.get(game, {}):
             action = ("roll", game, TEXT_ONE[game][rest], False)
-    if group and action is None:
-        return False
 
-    uid = update.effective_user.id
-    msg = update.effective_message
+    if action is None and group and rest:
+        return False  # в чате «краш на работе», «куб льда» и т.п. — обычная болтовня, бот молчит
     if await need_sub(update, ctx, uid):
         return True
     u = get_user(uid)
     ctx.user_data["game"] = game
     ctx.user_data.pop("await", None)
-
     bet = get_bet(ctx, uid)
     if action is None:
         if rest:
@@ -3110,9 +2968,8 @@ async def try_text_bet(update, ctx, text, group=False):
             await show_bet_menu(update, ctx, game)
         return True
     if not bet:
-        await msg.reply_text("💵 Сначала задайте ставку: напишите «ставка 1.5»" + ("" if group else " или выберите ниже 👇"))
-        if not group:
-            await show_bet_menu(update, ctx, game)
+        await msg.reply_text("💵 Сначала задайте ставку: напишите «ставка 1.5» или выберите ниже 👇")
+        await show_bet_menu(update, ctx, game)
         return True
     err = check_bet(bet, u["balance"])
     if err:
@@ -3164,9 +3021,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if low == "казна":
         await cmd_kazna(update, ctx)
         return
-    if low == "вагер":
-        ctx.user_data.pop("await", None)
-        await show_wager(update, ctx)
+
+    if low in SIMPLE_CMDS and not ctx.user_data.get("await"):
+        await SIMPLE_CMDS[low](update, ctx)
         return
 
     aw = ctx.user_data.get("await")
@@ -3254,7 +3111,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if amt < MIN_BET or amt > MAX_BET:
                 await update.message.reply_text(f"Ставка от {m(MIN_BET)} до {m(MAX_BET)}")
                 return
-            apply_custom_bet(ctx, uid, amt)
+            db.execute("UPDATE users SET custom_bet=? WHERE id=?", (amt, uid))
+            db.commit()
+            set_bet(ctx, uid, amt)
             await update.message.reply_text(f"⭐ Своя ставка: <b>{m(amt)}</b>", parse_mode=HTML)
             await show_games(update, ctx)
         elif cmd in ("деп", "пополнить"):
@@ -3353,8 +3212,8 @@ def extract_invoice(data):
     return evt, invoice_id, status
 
 
-def credit_deposit(invoice_id, provider="xr"):
-    """Атомарно зачисляет депозит по invoice_id (и добавляет вагер). Возвращает (user_id, amount, код)."""
+def credit_deposit(invoice_id, provider="xrocket"):
+    """Атомарно зачисляет депозит по invoice_id и начисляет вагер. Возвращает (user_id, amount, код)."""
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     try:
@@ -3367,7 +3226,10 @@ def credit_deposit(invoice_id, provider="xr"):
         if cur.rowcount != 1:
             conn.rollback()
             return None, None, "already"
-        credit_deposit_balance(conn, row["user_id"], row["amount"])
+        conn.execute(
+            "UPDATE users SET balance=balance+?, wager=wager+? WHERE id=?",
+            (row["amount"], int(row["amount"] * WAGER_X), row["user_id"]),
+        )
         conn.commit()
         return row["user_id"], row["amount"], "ok"
     finally:
@@ -3420,7 +3282,7 @@ def xrocket_webhook():
                             invoice_id, api_status, api_code)
                 # при сбое сети/лимите просим xRocket повторить доставку, иначе — просто игнорируем
                 return jsonify({"status": "unconfirmed"}), (503 if api_code in (0, 429) or api_code >= 500 else 200)
-            uid, amount, code = credit_deposit(invoice_id, "xr")
+            uid, amount, code = credit_deposit(invoice_id)
             if code == "ok":
                 log.info("Автозачисление: user %s +%s (invoice %s)", uid, m(amount), invoice_id)
                 tg_send(uid, f"✅ На ваш баланс зачислено {m(amount)}!")
@@ -3441,16 +3303,23 @@ def xrocket_webhook():
         return jsonify({"status": "error"}), 500
 
 
+def cb_verify_signature(raw, headers):
+    """Подпись вебхука Crypto Pay: HMAC-SHA256(тело) с ключом SHA256(API-токен), заголовок crypto-pay-api-signature."""
+    sig = headers.get("crypto-pay-api-signature")
+    if not sig or not CRYPTOBOT_TOKEN:
+        return False
+    key = hashlib.sha256(CRYPTOBOT_TOKEN.encode()).digest()
+    expected = hmac.new(key, raw, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig.strip().lower())
+
+
 @flask_app.route("/cryptobot-webhook", methods=["POST"])
 def cryptobot_webhook():
-    """Crypto Bot шлёт invoice_paid. Платёж подтверждаем запросом к API — поддельный вебхук денег не начислит."""
     try:
         raw = request.get_data()
-        sig_ok = cb_verify_signature(raw, request.headers)
-        if sig_ok is not True:
-            log.warning("CryptoBot webhook: подпись %s", "неверна" if sig_ok is False else "отсутствует")
-            if WEBHOOK_STRICT:
-                return jsonify({"status": "bad signature"}), 403
+        if not cb_verify_signature(raw, request.headers):
+            log.warning("CryptoBot webhook: неверная подпись")
+            return jsonify({"status": "bad signature"}), 403
         try:
             data = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
@@ -3458,28 +3327,25 @@ def cryptobot_webhook():
         if not isinstance(data, dict):
             return jsonify({"status": "bad json"}), 400
         log.info("CryptoBot webhook: %s", data.get("update_type"))
-        if data.get("update_type") != "invoice_paid":
-            return jsonify({"status": "ignored"}), 200
         inv = data.get("payload") if isinstance(data.get("payload"), dict) else {}
         invoice_id = inv.get("invoice_id")
-        if invoice_id is None:
-            return jsonify({"status": "no invoice"}), 200
-        api_status, api_code = cb_invoice_status(invoice_id)
-        confirmed = api_status == "paid" or (api_code == 0 and sig_ok is True)
-        if not confirmed:
-            log.warning("CryptoBot webhook: счёт %s не подтверждён API (status=%s, code=%s)", invoice_id, api_status, api_code)
-            return jsonify({"status": "unconfirmed"}), (503 if api_code in (0, 429) or api_code >= 500 else 200)
-        uid, amount, code = credit_deposit(invoice_id, "cb")
-        if code == "ok":
-            log.info("Автозачисление Crypto Bot: user %s +%s (invoice %s)", uid, m(amount), invoice_id)
-            tg_send(uid, f"✅ На ваш баланс зачислено {m(amount)}!")
-        elif code == "not_found":
-            log.error("CryptoBot webhook: счёт %s не найден в deposits", invoice_id)
-            tg_send(
-                ADMIN_ID,
-                f"⚠️ Оплачен счёт Crypto Bot {invoice_id}, но его нет в базе (возможно, создан после последнего бэкапа). "
-                f"Начислите вручную: /admin → «Баланс игрока». Payload: {str(inv.get('payload'))[:100]}",
-            )
+        if data.get("update_type") == "invoice_paid" and invoice_id is not None:
+            # не верим вебхуку на слово: статус «оплачен» подтверждаем запросом к API
+            status, code = cb_invoice_status(invoice_id)
+            if status != "paid":
+                log.warning("CryptoBot webhook: счёт %s не подтверждён API (status=%s, code=%s)", invoice_id, status, code)
+                return jsonify({"status": "unconfirmed"}), (503 if code in (0, 429) or code >= 500 else 200)
+            uid, amount, res = credit_deposit(invoice_id, "cryptobot")
+            if res == "ok":
+                log.info("Автозачисление (CryptoBot): user %s +%s (invoice %s)", uid, m(amount), invoice_id)
+                tg_send(uid, f"✅ На ваш баланс зачислено {m(amount)}!")
+            elif res == "not_found":
+                log.error("CryptoBot webhook: счёт %s не найден в deposits", invoice_id)
+                tg_send(
+                    ADMIN_ID,
+                    f"⚠️ Оплачен счёт Crypto Bot {invoice_id}, но его нет в базе. Игрок: {inv.get('payload') or 'неизвестен'}. "
+                    f"Начислите вручную: /admin → «Баланс игрока».",
+                )
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         log.exception("CryptoBot webhook error: %s", e)
@@ -3505,10 +3371,12 @@ def main():
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("kazna", cmd_kazna))
     app.add_handler(CommandHandler("backup", cmd_backup))
-    app.add_handler(CommandHandler(["balance", "bal"], cmd_balance))
-    app.add_handler(CommandHandler(["play", "games"], cmd_play))
-    app.add_handler(CommandHandler("wager", cmd_wager))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler(["balance", "bal"], _cmd(show_balance)))
+    app.add_handler(CommandHandler("wager", _cmd(show_wager)))
+    app.add_handler(CommandHandler("profile", _cmd(show_profile)))
+    app.add_handler(CommandHandler("menu", _cmd(show_menu)))
+    app.add_handler(CommandHandler("games", _cmd(show_games)))
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
